@@ -1,0 +1,70 @@
+[project]
+name = "portainer-mcp"
+version = "0.1.0"
+description = "MCP server that gives AI assistants 37 tools to manage Portainer: deploy stacks, manage containers, volumes, networks, exec commands, pull images, inspect endpoints, monitor resources"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "portainer",
+    "docker",
+    "docker-swarm",
+    "containers",
+    "devops",
+    "ai-tools",
+    "llm-tools",
+]
+readme = "README.md"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mcp[cli]>=1.2.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.urls]
+Homepage = "https://github.com/ginkida/portainer-mcp"
+Repository = "https://github.com/ginkida/portainer-mcp"
+Issues = "https://github.com/ginkida/portainer-mcp/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+portainer-mcp = "portainer_mcp.server:main"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

@@ -1,0 +1,38 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - portainerUrl
+      - portainerUsername
+      - portainerPassword
+    properties:
+      portainerUrl:
+        type: string
+        description: "Portainer base URL (e.g. https://portainer.example.com:9443)"
+      portainerUsername:
+        type: string
+        description: "Portainer username"
+      portainerPassword:
+        type: string
+        description: "Portainer password"
+      portainerDefaultEndpoint:
+        type: string
+        description: "Default endpoint ID"
+        default: "1"
+      portainerVerifySsl:
+        type: string
+        description: "Set to false for self-signed certificates"
+        default: "true"
+  commandFunction: |-
+    (config) => ({
+      command: 'python3',
+      args: ['-m', 'portainer_mcp.server'],
+      env: {
+        PORTAINER_URL: config.portainerUrl,
+        PORTAINER_USERNAME: config.portainerUsername,
+        PORTAINER_PASSWORD: config.portainerPassword,
+        PORTAINER_DEFAULT_ENDPOINT: config.portainerDefaultEndpoint ?? '1',
+        PORTAINER_VERIFY_SSL: config.portainerVerifySsl ?? 'true'
+      }
+    })
