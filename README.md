@@ -1,8 +1,13 @@
+<p align="center">
+  <img src="https://minio.ginkida.dev/minion/github/portainer-mcp.png" alt="Portainer MCP Server" width="600">
+</p>
+
 # Portainer MCP Server
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://python.org)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
+[![PyPI](https://img.shields.io/pypi/v/portainer-mcp)](https://pypi.org/project/portainer-mcp/)
 
 An MCP (Model Context Protocol) server that gives AI assistants — Claude, Copilot, Cursor, and others — **23 tools to manage Portainer container environments**: deploy and update stacks, start/stop/restart containers, pull/remove images, inspect endpoints, and manage users — all through natural language.
 
