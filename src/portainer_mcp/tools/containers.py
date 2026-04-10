@@ -442,9 +442,10 @@ def register(mcp: FastMCP) -> None:
         async def _fetch_laravel_errors(
             cid: str, name: str,
         ) -> tuple[str, str, str]:
+            safe_tail = int(tail)
             cmd = (
                 f'grep "production.ERROR\\|production.CRITICAL\\|production.EMERGENCY" '
-                f"{log_path} 2>/dev/null | tail -{tail}"
+                f"{log_path} 2>/dev/null | tail -{safe_tail}"
             )
             exec_body = {
                 "AttachStdout": True,
