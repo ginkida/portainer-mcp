@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -13,7 +14,23 @@ from ..errors import tool_error_handler
 logger = logging.getLogger(__name__)
 
 _CONTAINER_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,127}$")
+_STACK_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,63}$")
 _MAX_LOG_CHARS = 100_000
+
+_ERROR_LINE_RE = re.compile(
+    r"(?:"
+    r'" [45]\d{2} '
+    r"|\b(?:ERROR|CRITICAL|FATAL|EMERGENCY|ALERT)\b"
+    r"|\bException\b"
+    r"|\bTraceback\b"
+    r"|\bpanic:\s"
+    r"|\bFAILED\b"
+    r"|\bsegfault\b"
+    r"|\bOOM\b|\bout of memory\b"
+    r"|\bPHP (?:Fatal|Warning|Parse)\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def _validate_container_id(container_id: str) -> None:
@@ -213,6 +230,367 @@ def register(mcp: FastMCP) -> None:
         if len(output) > _MAX_LOG_CHARS:
             output = output[:_MAX_LOG_CHARS] + f"\n... truncated ({len(output)} total chars)"
         return output
+
+    @mcp.tool()
+    @tool_error_handler
+    async def portainer_container_logs_grep(
+        container_id: str,
+        pattern: str,
+        tail: int = 500,
+        context_lines: int = 0,
+        endpoint_id: int | None = None,
+    ) -> str:
+        """Search container logs for lines matching a regex pattern.
+
+        Returns only matching lines (with optional context). Useful for
+        finding specific errors, status codes, or keywords without
+        downloading the full log.
+
+        Args:
+            container_id: Container ID or name
+            pattern: Regex pattern to search for (case-insensitive)
+            tail: Number of log lines to fetch before filtering (default 500, max 1000)
+            context_lines: Lines of context around each match (default 0, max 5)
+            endpoint_id: Target endpoint ID (uses default if omitted)
+        """
+        _validate_container_id(container_id)
+        tail = max(1, min(tail, 1000))
+        context_lines = max(0, min(context_lines, 5))
+        regex = re.compile(pattern, re.IGNORECASE)
+
+        client = get_client()
+        config = get_config()
+        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        resp = await client.request(
+            "GET",
+            f"/api/endpoints/{eid}/docker/containers/{container_id}/logs",
+            params={"stdout": "true", "stderr": "true", "tail": str(tail)},
+        )
+        text = _parse_docker_stream(resp.content)
+        lines = text.splitlines()
+
+        hit_indices = [i for i, line in enumerate(lines) if regex.search(line)]
+
+        if context_lines > 0 and hit_indices:
+            visible: set[int] = set()
+            for idx in hit_indices:
+                for j in range(
+                    max(0, idx - context_lines),
+                    min(len(lines), idx + context_lines + 1),
+                ):
+                    visible.add(j)
+            output_lines = [lines[i] for i in sorted(visible)]
+        else:
+            output_lines = [lines[i] for i in hit_indices]
+
+        result = json.dumps(
+            {
+                "container_id": container_id,
+                "pattern": pattern,
+                "lines_scanned": len(lines),
+                "matches_found": len(hit_indices),
+                "lines": output_lines,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        if len(result) > _MAX_LOG_CHARS:
+            result = result[:_MAX_LOG_CHARS] + "\n... truncated"
+        return result
+
+    @mcp.tool()
+    @tool_error_handler
+    async def portainer_stack_logs_errors(
+        stack_name: str,
+        tail: int = 500,
+        endpoint_id: int | None = None,
+    ) -> str:
+        """Scan all running containers in a stack for errors.
+
+        Fetches logs from every running container whose name starts with
+        the given stack name and filters for common error patterns:
+        HTTP 4xx/5xx, exceptions, fatal/critical/emergency log levels,
+        panics, OOM, PHP errors, segfaults, etc.
+
+        Args:
+            stack_name: Stack name prefix (e.g. "taylor", "blog", "somnlyx")
+            tail: Log lines per container to scan (default 500, max 1000)
+            endpoint_id: Target endpoint ID (uses default if omitted)
+        """
+        if not _STACK_NAME_RE.match(stack_name):
+            raise ValueError(f"Invalid stack_name: {stack_name!r}")
+        tail = max(1, min(tail, 1000))
+
+        client = get_client()
+        config = get_config()
+        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+
+        containers = await client.get(
+            f"/api/endpoints/{eid}/docker/containers/json",
+            params={"all": "false"},
+        )
+
+        prefix = f"/{stack_name}_"
+        targets: list[tuple[str, str]] = []
+        for c in containers:
+            for name in c.get("Names", []):
+                if name.startswith(prefix):
+                    short = name[1:].rsplit(".", 1)[0]
+                    targets.append((c["Id"][:12], short))
+                    break
+
+        if not targets:
+            return json.dumps({
+                "stack": stack_name,
+                "containers_scanned": 0,
+                "total_errors": 0,
+                "message": f"No running containers found for stack '{stack_name}'",
+            })
+
+        async def _fetch_errors(cid: str, name: str) -> tuple[str, str, int, list[str]]:
+            resp = await client.request(
+                "GET",
+                f"/api/endpoints/{eid}/docker/containers/{cid}/logs",
+                params={"stdout": "true", "stderr": "true", "tail": str(tail)},
+            )
+            text = _parse_docker_stream(resp.content)
+            all_lines = text.splitlines()
+            errors = [ln for ln in all_lines if _ERROR_LINE_RE.search(ln)]
+            return name, cid, len(all_lines), errors
+
+        results = await asyncio.gather(
+            *[_fetch_errors(cid, name) for cid, name in targets],
+        )
+
+        container_results = {}
+        total_errors = 0
+        for name, cid, lines_scanned, errors in results:
+            total_errors += len(errors)
+            container_results[name] = {
+                "container_id": cid,
+                "lines_scanned": lines_scanned,
+                "errors_found": len(errors),
+                "errors": errors,
+            }
+
+        output = json.dumps(
+            {
+                "stack": stack_name,
+                "containers_scanned": len(targets),
+                "total_errors": total_errors,
+                "containers": container_results,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        if len(output) > _MAX_LOG_CHARS:
+            output = output[:_MAX_LOG_CHARS] + "\n... truncated"
+        return output
+
+    @mcp.tool()
+    @tool_error_handler
+    async def portainer_laravel_errors(
+        stack_name: str,
+        tail: int = 50,
+        endpoint_id: int | None = None,
+    ) -> str:
+        """Get Laravel application-level errors from storage/logs/laravel.log.
+
+        Executes inside each running backend/horizon container of a stack
+        to read the actual Laravel error log (not nginx access log).
+        Returns production.ERROR entries with exception messages and context.
+
+        Use this AFTER portainer_stack_logs_errors to get root cause details
+        behind HTTP 500 errors seen in nginx access logs.
+
+        Args:
+            stack_name: Stack name prefix (e.g. "taylor", "blog", "somnlyx")
+            tail: Number of error lines to return per container (default 50, max 200)
+            endpoint_id: Target endpoint ID (uses default if omitted)
+        """
+        if not _STACK_NAME_RE.match(stack_name):
+            raise ValueError(f"Invalid stack_name: {stack_name!r}")
+        tail = max(1, min(tail, 200))
+
+        client = get_client()
+        config = get_config()
+        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+
+        containers = await client.get(
+            f"/api/endpoints/{eid}/docker/containers/json",
+            params={"all": "false"},
+        )
+
+        prefix = f"/{stack_name}_"
+        targets: list[tuple[str, str]] = []
+        for c in containers:
+            for name in c.get("Names", []):
+                if name.startswith(prefix):
+                    short = name[1:].rsplit(".", 1)[0]
+                    targets.append((c["Id"][:12], short))
+                    break
+
+        if not targets:
+            return json.dumps({
+                "stack": stack_name,
+                "containers_scanned": 0,
+                "message": f"No running containers found for stack '{stack_name}'",
+            })
+
+        log_path = "/var/www/app/storage/logs/laravel.log"
+
+        async def _fetch_laravel_errors(
+            cid: str, name: str,
+        ) -> tuple[str, str, str]:
+            cmd = (
+                f'grep "production.ERROR\\|production.CRITICAL\\|production.EMERGENCY" '
+                f"{log_path} 2>/dev/null | tail -{tail}"
+            )
+            exec_body = {
+                "AttachStdout": True,
+                "AttachStderr": True,
+                "Cmd": ["sh", "-c", cmd],
+            }
+            try:
+                exec_resp = await client.post(
+                    f"/api/endpoints/{eid}/docker/containers/{cid}/exec",
+                    json=exec_body,
+                )
+                exec_id = exec_resp["Id"]
+                start_resp = await client.request(
+                    "POST",
+                    f"/api/endpoints/{eid}/docker/exec/{exec_id}/start",
+                    json={"Detach": False, "Tty": False},
+                )
+                output = _parse_docker_stream(start_resp.content)
+            except Exception as exc:
+                output = f"exec failed: {exc}"
+            return name, cid, output
+
+        results = await asyncio.gather(
+            *[_fetch_laravel_errors(cid, name) for cid, name in targets],
+        )
+
+        container_results = {}
+        for name, cid, output in results:
+            lines = [ln for ln in output.splitlines() if ln.strip()]
+            container_results[name] = {
+                "container_id": cid,
+                "errors_found": len(lines),
+                "errors": lines,
+            }
+
+        result = json.dumps(
+            {
+                "stack": stack_name,
+                "containers_scanned": len(targets),
+                "log_path": log_path,
+                "containers": container_results,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        if len(result) > _MAX_LOG_CHARS:
+            result = result[:_MAX_LOG_CHARS] + "\n... truncated"
+        return result
+
+    @mcp.tool()
+    @tool_error_handler
+    async def portainer_laravel_tinker(
+        stack_name: str,
+        code: str,
+        endpoint_id: int | None = None,
+    ) -> str:
+        """Execute PHP code via Laravel Tinker inside a stack's backend container.
+
+        Finds a running backend container for the given stack and runs
+        `php artisan tinker --execute="<code>"`. Useful for inspecting
+        database records, checking model state, running one-off fixes,
+        and debugging application issues.
+
+        Args:
+            stack_name: Stack name prefix (e.g. "taylor", "blog", "somnlyx")
+            code: PHP code to execute (will be passed to tinker --execute)
+            endpoint_id: Target endpoint ID (uses default if omitted)
+        """
+        if not _STACK_NAME_RE.match(stack_name):
+            raise ValueError(f"Invalid stack_name: {stack_name!r}")
+        if len(code) > 4096:
+            raise ValueError("Code too long (max 4096 chars)")
+
+        client = get_client()
+        config = get_config()
+        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+
+        containers = await client.get(
+            f"/api/endpoints/{eid}/docker/containers/json",
+            params={"all": "false"},
+        )
+
+        # Find first running backend container for the stack
+        prefix = f"/{stack_name}_backend."
+        target_id: str | None = None
+        target_name: str | None = None
+        for c in containers:
+            for name in c.get("Names", []):
+                if name.startswith(prefix):
+                    target_id = c["Id"][:12]
+                    target_name = name[1:].rsplit(".", 1)[0]
+                    break
+            if target_id:
+                break
+
+        if not target_id:
+            return json.dumps({
+                "error": f"No running backend container found for stack '{stack_name}'",
+            })
+
+        logger.info(
+            "AUDIT: Laravel tinker in %s (%s) on endpoint %d: %s",
+            target_name, target_id, eid, code[:200],
+        )
+
+        # Escape single quotes in code for safe shell embedding
+        safe_code = code.replace("'", "'\\''")
+        exec_body = {
+            "AttachStdout": True,
+            "AttachStderr": True,
+            "Cmd": [
+                "sh", "-c",
+                f"cd /var/www/app && php artisan tinker --execute='{safe_code}'",
+            ],
+        }
+        exec_resp = await client.post(
+            f"/api/endpoints/{eid}/docker/containers/{target_id}/exec",
+            json=exec_body,
+        )
+        exec_id = exec_resp["Id"]
+
+        start_resp = await client.request(
+            "POST",
+            f"/api/endpoints/{eid}/docker/exec/{exec_id}/start",
+            json={"Detach": False, "Tty": False},
+        )
+        output = _parse_docker_stream(start_resp.content)
+
+        inspect = await client.get(
+            f"/api/endpoints/{eid}/docker/exec/{exec_id}/json",
+        )
+        exit_code = inspect.get("ExitCode", -1)
+
+        if len(output) > _MAX_LOG_CHARS:
+            output = output[:_MAX_LOG_CHARS] + "\n... truncated"
+
+        return json.dumps(
+            {
+                "container": target_name,
+                "container_id": target_id,
+                "exit_code": exit_code,
+                "output": output,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
 
     @mcp.tool()
     @tool_error_handler
