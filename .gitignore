@@ -11,8 +11,9 @@ dist/
 build/
 *.egg
 
-# Claude Code (contains credentials)
-.claude/settings.json
+# Claude Code (worktrees, settings, MCP credentials, dev guide)
+.claude/
+CLAUDE.md
 .mcp.json
 
 # IDE
