@@ -7,6 +7,22 @@ from mcp.server.fastmcp import FastMCP
 from ..client import get_client
 from ..errors import tool_error_handler
 
+# Whitelist of fields safe to return from /api/users/{id}. Portainer's user
+# object historically includes Password (hashed), TFA secret material and
+# tokens — never forward those.
+_USER_SAFE_FIELDS = frozenset({
+    "Id",
+    "Username",
+    "Role",
+    "RoleName",
+    "EndpointAuthorizations",
+    "PortainerAuthorizations",
+    "UserTheme",
+    "ThemeSettings",
+    "UseCache",
+    "TokenIssueAt",
+})
+
 
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
@@ -34,4 +50,5 @@ def register(mcp: FastMCP) -> None:
         """
         client = get_client()
         user = await client.get(f"/api/users/{user_id}")
-        return json.dumps(user, indent=2)
+        filtered = {k: v for k, v in user.items() if k in _USER_SAFE_FIELDS}
+        return json.dumps(filtered, indent=2)

@@ -4,6 +4,7 @@ import json
 import logging
 import re
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
@@ -55,8 +56,11 @@ def register(mcp: FastMCP) -> None:
         try:
             file_resp = await client.get(f"/api/stacks/{stack_id}/file")
             stack["ComposeFileContent"] = file_resp.get("StackFileContent", "")
-        except Exception:
-            logger.debug("Could not fetch compose file for stack %d", stack_id)
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "Could not fetch compose file for stack %d: HTTP %d",
+                stack_id, exc.response.status_code,
+            )
             stack["ComposeFileContent"] = ""
         return json.dumps(stack, indent=2)
 

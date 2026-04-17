@@ -14,7 +14,9 @@ from ..errors import tool_error_handler
 logger = logging.getLogger(__name__)
 
 _CONTAINER_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,127}$")
-_STACK_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,63}$")
+# Must stay in sync with stacks.py:_STACK_NAME_RE — Docker Swarm stack names
+# do not allow dots, so neither should we when accepting one as input.
+_STACK_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}$")
 _MAX_LOG_CHARS = 100_000
 
 _ERROR_LINE_RE = re.compile(
@@ -42,18 +44,41 @@ def _validate_container_id(container_id: str) -> None:
 
 
 def _parse_docker_stream(raw: bytes) -> str:
-    """Parse Docker multiplexed stream (8-byte header per frame)."""
+    """Parse Docker multiplexed stream (8-byte header per frame).
+
+    Falls back to a plain UTF-8 decode of the whole buffer when no frames can
+    be parsed (e.g. responses from non-TTY exec without multiplexing).
+    Truncated trailing frames are decoded best-effort and a debug log emitted.
+    """
     lines: list[str] = []
     i = 0
-    while i < len(raw):
-        if i + 8 <= len(raw):
-            size = int.from_bytes(raw[i + 4 : i + 8], "big")
-            i += 8
-            if size > 0 and i + size <= len(raw):
-                lines.append(raw[i : i + size].decode("utf-8", errors="replace"))
-            i += size
-        else:
+    n = len(raw)
+    while i < n:
+        if i + 8 > n:
+            logger.debug(
+                "Docker stream ended mid-header at byte %d/%d", i, n,
+            )
             break
+        size = int.from_bytes(raw[i + 4 : i + 8], "big")
+        i += 8
+        if size <= 0:
+            continue
+        if i + size > n:
+            # Either the stream was truncated mid-frame, or the buffer isn't
+            # multiplexed at all and we just misread random bytes as a header.
+            # If we've already decoded at least one frame, treat as truncation;
+            # otherwise fall back to a plain decode of the whole buffer so we
+            # don't silently drop the first 8 bytes of plain text.
+            if not lines:
+                return raw.decode("utf-8", errors="replace")
+            logger.debug(
+                "Docker stream truncated frame: need %d bytes, have %d",
+                size, n - i,
+            )
+            lines.append(raw[i:].decode("utf-8", errors="replace"))
+            break
+        lines.append(raw[i : i + size].decode("utf-8", errors="replace"))
+        i += size
     return "".join(lines) if lines else raw.decode("utf-8", errors="replace")
 
 
@@ -256,7 +281,10 @@ def register(mcp: FastMCP) -> None:
         _validate_container_id(container_id)
         tail = max(1, min(tail, 1000))
         context_lines = max(0, min(context_lines, 5))
-        regex = re.compile(pattern, re.IGNORECASE)
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(f"Invalid regex pattern: {exc}") from None
 
         client = get_client()
         config = get_config()
@@ -443,8 +471,10 @@ def register(mcp: FastMCP) -> None:
             cid: str, name: str,
         ) -> tuple[str, str, str]:
             safe_tail = int(tail)
+            # grep -E (ERE) is portable; \. matches a literal dot so we don't
+            # also catch e.g. "productionXERROR".
             cmd = (
-                f'grep "production.ERROR\\|production.CRITICAL\\|production.EMERGENCY" '
+                f'grep -E "production\\.(ERROR|CRITICAL|EMERGENCY)" '
                 f"{log_path} 2>/dev/null | tail -{safe_tail}"
             )
             exec_body = {
