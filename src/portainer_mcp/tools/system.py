@@ -6,7 +6,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
 from ..config import get_config
-from ..errors import tool_error_handler
+from ..errors import resolve_endpoint, tool_error_handler
 
 
 def register(mcp: FastMCP) -> None:
@@ -20,7 +20,7 @@ def register(mcp: FastMCP) -> None:
         """
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         info = await client.get(f"/api/endpoints/{eid}/docker/info")
         return json.dumps({
             "name": info.get("Name"),
@@ -37,7 +37,7 @@ def register(mcp: FastMCP) -> None:
             "images": info.get("Images"),
             "storage_driver": info.get("Driver"),
             "swarm_active": info.get("Swarm", {}).get("LocalNodeState") == "active",
-        }, indent=2)
+        }, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -49,7 +49,7 @@ def register(mcp: FastMCP) -> None:
         """
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         df = await client.get(f"/api/endpoints/{eid}/docker/system/df")
 
         def _size_mb(b: int) -> float:
@@ -82,4 +82,4 @@ def register(mcp: FastMCP) -> None:
                 "count": len(build_cache),
                 "total_mb": _size_mb(sum(b.get("Size", 0) or 0 for b in build_cache)),
             },
-        }, indent=2)
+        }, indent=2, ensure_ascii=False)

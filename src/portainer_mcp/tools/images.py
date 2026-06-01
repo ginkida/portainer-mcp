@@ -10,7 +10,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
 from ..config import get_config
-from ..errors import error_response, tool_error_handler
+from ..errors import error_response, resolve_endpoint, tool_error_handler
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,9 @@ _IMAGE_REF_RE = re.compile(
 )
 # Base64 (standard or URL-safe), with or without padding.
 _REGISTRY_AUTH_RE = re.compile(r"^[A-Za-z0-9+/_\-]+={0,2}$")
+# Cap on the /images/create progress stream we buffer before scanning for
+# errors — a runaway pull log shouldn't exhaust memory.
+_MAX_PULL_RESPONSE_BYTES = 5_000_000
 
 
 def _validate_image_ref(ref: str) -> None:
@@ -78,7 +81,7 @@ def register(mcp: FastMCP) -> None:
         """
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         images = await client.get(
             f"/api/endpoints/{eid}/docker/images/json",
         )
@@ -90,7 +93,7 @@ def register(mcp: FastMCP) -> None:
                 "size_mb": round(img.get("Size", 0) / 1_048_576, 1),
                 "created": img.get("Created"),
             })
-        return json.dumps(result, indent=2)
+        return json.dumps(result, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -107,12 +110,12 @@ def register(mcp: FastMCP) -> None:
         _validate_image_ref(image_id)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         safe_id = quote(image_id, safe="")
         data = await client.get(
             f"/api/endpoints/{eid}/docker/images/{safe_id}/json",
         )
-        return json.dumps(data, indent=2)
+        return json.dumps(data, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -135,7 +138,7 @@ def register(mcp: FastMCP) -> None:
         _validate_image_ref(f"{image_name}:{tag}")
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
 
         headers: dict[str, str] = {}
         if registry_auth is not None:
@@ -148,11 +151,22 @@ def register(mcp: FastMCP) -> None:
             f"/api/endpoints/{eid}/docker/images/create",
             params={"fromImage": image_name, "tag": tag},
             headers=headers,
+            # Pulls routinely run for minutes; the default timeout would abort them.
+            timeout=config.long_timeout,
         )
 
         # Docker streams progress as line-delimited JSON. A successful HTTP
         # status does NOT mean the pull succeeded — errors are in the body.
-        errors = _scan_pull_stream(resp.text)
+        # Read bytes (not .text) and bound the buffer so a runaway progress
+        # stream can't exhaust memory.
+        body = resp.content
+        if len(body) > _MAX_PULL_RESPONSE_BYTES:
+            logger.warning(
+                "Image pull response is %d bytes; scanning first %d",
+                len(body), _MAX_PULL_RESPONSE_BYTES,
+            )
+            body = body[:_MAX_PULL_RESPONSE_BYTES]
+        errors = _scan_pull_stream(body.decode("utf-8", errors="replace"))
         if errors:
             return error_response(
                 "Image pull failed",
@@ -161,7 +175,7 @@ def register(mcp: FastMCP) -> None:
         return json.dumps({
             "status": "pulled",
             "image": f"{image_name}:{tag}",
-        })
+        }, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -178,13 +192,13 @@ def register(mcp: FastMCP) -> None:
         _validate_image_ref(image_id)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         logger.info("AUDIT: Removing image %s on endpoint %d", image_id, eid)
         safe_id = quote(image_id, safe="")
         await client.delete(
             f"/api/endpoints/{eid}/docker/images/{safe_id}",
         )
-        return json.dumps({"status": "removed", "image_id": image_id})
+        return json.dumps({"status": "removed", "image_id": image_id}, ensure_ascii=False)
 
 
 # Re-exported for callers that want to assemble the X-Registry-Auth header

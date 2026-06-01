@@ -191,11 +191,17 @@ mcpServers:
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PORTAINER_URL` | **Yes** | — | Portainer base URL (e.g. `https://portainer.example.com:9443`) |
+| `PORTAINER_URL` | **Yes** | — | Portainer base URL, e.g. `https://portainer.example.com:9443`. Must be a root URL (no path). Plain `http://` to a non-loopback host is allowed but logs a cleartext-credentials warning. |
 | `PORTAINER_USERNAME` | **Yes** | — | Portainer username |
 | `PORTAINER_PASSWORD` | **Yes** | — | Portainer password |
 | `PORTAINER_DEFAULT_ENDPOINT` | No | `1` | Default endpoint ID for container/image/stack operations |
 | `PORTAINER_VERIFY_SSL` | No | `true` | Set to `false` for self-signed certificates |
+| `PORTAINER_TIMEOUT` | No | `30` | Timeout (seconds) for ordinary API calls |
+| `PORTAINER_LONG_TIMEOUT` | No | `300` | Timeout (seconds) for long-running operations: image pull, container exec, large log scans |
+| `PORTAINER_HTTP_MAX_CONNECTIONS` | No | `100` | Max concurrent HTTP connections to Portainer |
+| `PORTAINER_HTTP_MAX_KEEPALIVE` | No | `20` | Max idle keep-alive connections |
+
+All values are validated at startup — a malformed URL, a non-numeric timeout, or a non-positive limit fails fast with a clear error instead of breaking later.
 
 ---
 

@@ -9,11 +9,17 @@ from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
 from ..config import get_config
-from ..errors import tool_error_handler
+from ..errors import resolve_endpoint, tool_error_handler, validate_id
 
 logger = logging.getLogger(__name__)
 
+# 1-64 chars: one leading alphanumeric + up to 63 of [alnum _ -] (no dots);
+# aligns with Docker Swarm stack-name rules. Keep in sync with containers.py.
 _STACK_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}$")
+
+# Compose files are normally a few KB; this is a defensive ceiling on the
+# inspect payload so a pathological stack file can't blow up memory.
+_MAX_COMPOSE_CHARS = 500_000
 
 
 def _validate_stack_name(name: str) -> None:
@@ -41,7 +47,7 @@ def register(mcp: FastMCP) -> None:
                 "endpoint_id": s.get("EndpointId"),
                 "creation_date": s.get("CreationDate"),
             })
-        return json.dumps(result, indent=2)
+        return json.dumps(result, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -51,18 +57,26 @@ def register(mcp: FastMCP) -> None:
         Args:
             stack_id: The ID of the stack to inspect
         """
+        validate_id(stack_id, "stack_id")
         client = get_client()
         stack = await client.get(f"/api/stacks/{stack_id}")
         try:
             file_resp = await client.get(f"/api/stacks/{stack_id}/file")
-            stack["ComposeFileContent"] = file_resp.get("StackFileContent", "")
+            content = file_resp.get("StackFileContent", "")
+            if len(content) > _MAX_COMPOSE_CHARS:
+                logger.warning(
+                    "Compose file for stack %d is %d chars; truncating to %d",
+                    stack_id, len(content), _MAX_COMPOSE_CHARS,
+                )
+                content = content[:_MAX_COMPOSE_CHARS] + "\n... truncated"
+            stack["ComposeFileContent"] = content
         except httpx.HTTPStatusError as exc:
             logger.warning(
                 "Could not fetch compose file for stack %d: HTTP %d",
                 stack_id, exc.response.status_code,
             )
             stack["ComposeFileContent"] = ""
-        return json.dumps(stack, indent=2)
+        return json.dumps(stack, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -81,7 +95,7 @@ def register(mcp: FastMCP) -> None:
         _validate_stack_name(name)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         logger.info("AUDIT: Deploying stack %r on endpoint %d", name, eid)
 
         # Detect Swarm vs standalone to use the correct API path
@@ -108,8 +122,8 @@ def register(mcp: FastMCP) -> None:
             json=body,
         )
         if result:
-            return json.dumps(result, indent=2)
-        return json.dumps({"status": "deployed", "name": name})
+            return json.dumps(result, indent=2, ensure_ascii=False)
+        return json.dumps({"status": "deployed", "name": name}, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -125,9 +139,10 @@ def register(mcp: FastMCP) -> None:
             compose_content: New Docker Compose content (YAML). If omitted, redeploys existing.
             endpoint_id: Endpoint ID (uses default if omitted)
         """
+        validate_id(stack_id, "stack_id")
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         logger.info("AUDIT: Updating stack %d on endpoint %d", stack_id, eid)
 
         if compose_content is None:
@@ -144,8 +159,8 @@ def register(mcp: FastMCP) -> None:
             json=body,
         )
         if result:
-            return json.dumps(result, indent=2)
-        return json.dumps({"status": "updated", "stack_id": stack_id})
+            return json.dumps(result, indent=2, ensure_ascii=False)
+        return json.dumps({"status": "updated", "stack_id": stack_id}, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -155,10 +170,11 @@ def register(mcp: FastMCP) -> None:
         Args:
             stack_id: The ID of the stack to delete
         """
+        validate_id(stack_id, "stack_id")
         client = get_client()
         logger.info("AUDIT: Deleting stack %d", stack_id)
         await client.delete(f"/api/stacks/{stack_id}")
-        return json.dumps({"status": "deleted", "stack_id": stack_id})
+        return json.dumps({"status": "deleted", "stack_id": stack_id}, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -168,12 +184,13 @@ def register(mcp: FastMCP) -> None:
         Args:
             stack_id: The ID of the stack to start
         """
+        validate_id(stack_id, "stack_id")
         client = get_client()
         logger.info("AUDIT: Starting stack %d", stack_id)
         result = await client.post(f"/api/stacks/{stack_id}/start")
         if result:
-            return json.dumps(result, indent=2)
-        return json.dumps({"status": "started", "stack_id": stack_id})
+            return json.dumps(result, indent=2, ensure_ascii=False)
+        return json.dumps({"status": "started", "stack_id": stack_id}, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -183,9 +200,10 @@ def register(mcp: FastMCP) -> None:
         Args:
             stack_id: The ID of the stack to stop
         """
+        validate_id(stack_id, "stack_id")
         client = get_client()
         logger.info("AUDIT: Stopping stack %d", stack_id)
         result = await client.post(f"/api/stacks/{stack_id}/stop")
         if result:
-            return json.dumps(result, indent=2)
-        return json.dumps({"status": "stopped", "stack_id": stack_id})
+            return json.dumps(result, indent=2, ensure_ascii=False)
+        return json.dumps({"status": "stopped", "stack_id": stack_id}, ensure_ascii=False)

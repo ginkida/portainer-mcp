@@ -15,6 +15,12 @@ _client: PortainerClient | None = None
 
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
 
+# Defense-in-depth cap on a single response body. Portainer/Docker list and
+# inspect payloads are normally well under a megabyte; a response advertising
+# more than this almost certainly signals a misconfigured endpoint, and parsing
+# it would needlessly inflate memory.
+_MAX_RESPONSE_BYTES = 50_000_000
+
 
 class PortainerClient:
     """HTTP client for the Portainer API with JWT authentication."""
@@ -31,11 +37,20 @@ class PortainerClient:
         # whether another concurrent task already refreshed the JWT.
         self._auth_version: int = 0
         self._auth_lock = asyncio.Lock()
+        # Separate lock just for opportunistic CSRF-token writes harvested from
+        # response headers, so they can't interleave with each other. Reads in
+        # _headers() stay lock-free (a single attribute read is atomic in
+        # CPython and any harvested token is valid).
+        self._csrf_lock = asyncio.Lock()
         self._base_url_str = config.url
         self._http = httpx.AsyncClient(
             base_url=config.url,
             verify=config.verify_ssl,
-            timeout=30.0,
+            timeout=config.timeout,
+            limits=httpx.Limits(
+                max_connections=config.http_max_connections,
+                max_keepalive_connections=config.http_max_keepalive,
+            ),
         )
 
     def _jwt_is_fresh(self) -> bool:
@@ -53,18 +68,26 @@ class PortainerClient:
             json={"username": config.username, "password": config.password},
         )
         resp.raise_for_status()
-        self._jwt = resp.json()["jwt"]
-        self._jwt_obtained_at = time.monotonic()
-        self._auth_version += 1
+        jwt = resp.json()["jwt"]
+        jwt_obtained_at = time.monotonic()
         # Fetch CSRF token from an authenticated GET (no Referer for reads).
         csrf_resp = await self._http.get(
             "/api/status",
-            headers={"Authorization": f"Bearer {self._jwt}"},
+            headers={"Authorization": f"Bearer {jwt}"},
         )
-        self._csrf_token = csrf_resp.headers.get("x-csrf-token") or None
+        # If this GET fails we must NOT commit the new auth state: a half-set
+        # JWT with a bumped _auth_version would wedge the client, because a
+        # later _refresh_auth would see a matching version and refuse to retry.
+        csrf_resp.raise_for_status()
+        csrf_token = csrf_resp.headers.get("x-csrf-token") or None
+        # Commit the new generation only after BOTH calls succeed.
+        self._jwt = jwt
+        self._jwt_obtained_at = jwt_obtained_at
+        self._csrf_token = csrf_token
+        self._auth_version += 1
         logger.debug(
             "Authentication successful (CSRF token: %s)",
-            "present" if self._csrf_token else "absent",
+            "present" if csrf_token else "absent",
         )
 
     async def _ensure_auth(self) -> None:
@@ -84,6 +107,22 @@ class PortainerClient:
                 return
             await self._do_authenticate()
 
+    async def _capture_csrf(self, resp: httpx.Response) -> None:
+        """Opportunistically refresh the CSRF token from a response header."""
+        new_csrf = resp.headers.get("x-csrf-token")
+        if new_csrf:
+            async with self._csrf_lock:
+                self._csrf_token = new_csrf
+
+    @staticmethod
+    def _enforce_response_size(resp: httpx.Response) -> None:
+        cl = resp.headers.get("content-length")
+        if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
+            raise ValueError(
+                f"Portainer response too large: {cl} bytes "
+                f"(max {_MAX_RESPONSE_BYTES})."
+            )
+
     def _headers(self, method: str = "GET") -> dict[str, str]:
         h: dict[str, str] = {"Authorization": f"Bearer {self._jwt}"}
         # Referer + CSRF token only for mutating methods.
@@ -98,6 +137,7 @@ class PortainerClient:
         self,
         method: str,
         path: str,
+        timeout: float | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
         await self._ensure_auth()
@@ -107,32 +147,41 @@ class PortainerClient:
         # Caller-supplied headers are preserved; auth headers win on conflict
         # so callers can't accidentally drop the Bearer token.
         user_headers = kwargs.pop("headers", None) or {}
+        # A per-request timeout override (slow ops like pull/exec) flows to all
+        # retries via **kwargs; when None we leave the client default in place.
+        if timeout is not None:
+            kwargs["timeout"] = timeout
         merged_headers = {**user_headers, **self._headers(method)}
-        resp = await self._http.request(
-            method, path, headers=merged_headers, **kwargs
-        )
-        # Refresh CSRF token from response if present
-        new_csrf = resp.headers.get("x-csrf-token")
-        if new_csrf:
-            self._csrf_token = new_csrf
+        resp = await self._http.request(method, path, headers=merged_headers, **kwargs)
+        await self._capture_csrf(resp)
         if resp.status_code == 401:
             logger.debug("Token expired, re-authenticating")
             await self._refresh_auth(attempted_version)
             attempted_version = self._auth_version
+            if method.upper() in _UNSAFE_METHODS:
+                logger.warning(
+                    "Retrying %s %s after 401; the mutation may be applied twice "
+                    "if it had already taken effect server-side.",
+                    method,
+                    path,
+                )
             merged_headers = {**user_headers, **self._headers(method)}
-            resp = await self._http.request(
-                method, path, headers=merged_headers, **kwargs
-            )
-            new_csrf = resp.headers.get("x-csrf-token")
-            if new_csrf:
-                self._csrf_token = new_csrf
+            resp = await self._http.request(method, path, headers=merged_headers, **kwargs)
+            await self._capture_csrf(resp)
         if resp.status_code == 403 and "CSRF" in resp.text:
             logger.debug("CSRF token expired, refreshing")
             await self._refresh_auth(attempted_version)
+            if method.upper() in _UNSAFE_METHODS:
+                logger.warning(
+                    "Retrying %s %s after 403 CSRF; the mutation may be applied "
+                    "twice if it had already taken effect server-side.",
+                    method,
+                    path,
+                )
             merged_headers = {**user_headers, **self._headers(method)}
-            resp = await self._http.request(
-                method, path, headers=merged_headers, **kwargs
-            )
+            resp = await self._http.request(method, path, headers=merged_headers, **kwargs)
+            await self._capture_csrf(resp)
+        self._enforce_response_size(resp)
         resp.raise_for_status()
         return resp
 

@@ -5,7 +5,7 @@ import json
 from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
-from ..errors import tool_error_handler
+from ..errors import tool_error_handler, validate_id
 
 _ENDPOINT_SAFE_FIELDS = {
     "Id", "Name", "Type", "URL", "Status", "GroupId", "PublicURL",
@@ -30,7 +30,7 @@ def register(mcp: FastMCP) -> None:
                 "status": ep.get("Status"),
                 "group_id": ep.get("GroupId"),
             })
-        return json.dumps(result, indent=2)
+        return json.dumps(result, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -40,7 +40,8 @@ def register(mcp: FastMCP) -> None:
         Args:
             endpoint_id: The ID of the endpoint to inspect
         """
+        validate_id(endpoint_id, "endpoint_id")
         client = get_client()
         ep = await client.get(f"/api/endpoints/{endpoint_id}")
         filtered = {k: v for k, v in ep.items() if k in _ENDPOINT_SAFE_FIELDS}
-        return json.dumps(filtered, indent=2)
+        return json.dumps(filtered, indent=2, ensure_ascii=False)
