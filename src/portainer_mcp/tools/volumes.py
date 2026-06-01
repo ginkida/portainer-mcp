@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
 from ..config import get_config
-from ..errors import tool_error_handler
+from ..errors import resolve_endpoint, tool_error_handler
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ def register(mcp: FastMCP) -> None:
         """
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         data = await client.get(f"/api/endpoints/{eid}/docker/volumes")
         volumes = data.get("Volumes") or []
         result = []
@@ -47,7 +48,7 @@ def register(mcp: FastMCP) -> None:
                 "created_at": v.get("CreatedAt"),
                 "labels": v.get("Labels") or {},
             })
-        return json.dumps(result, indent=2)
+        return json.dumps(result, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -64,11 +65,11 @@ def register(mcp: FastMCP) -> None:
         _validate_volume_name(volume_name)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         data = await client.get(
             f"/api/endpoints/{eid}/docker/volumes/{volume_name}",
         )
-        return json.dumps(data, indent=2)
+        return json.dumps(data, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -89,9 +90,9 @@ def register(mcp: FastMCP) -> None:
         _validate_volume_name(name)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         logger.info("AUDIT: Creating volume %r on endpoint %d", name, eid)
-        body: dict = {"Name": name, "Driver": driver}
+        body: dict[str, Any] = {"Name": name, "Driver": driver}
         if labels:
             body["Labels"] = labels
         data = await client.post(
@@ -99,8 +100,8 @@ def register(mcp: FastMCP) -> None:
             json=body,
         )
         if data:
-            return json.dumps(data, indent=2)
-        return json.dumps({"status": "created", "name": name})
+            return json.dumps(data, indent=2, ensure_ascii=False)
+        return json.dumps({"status": "created", "name": name}, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -119,10 +120,12 @@ def register(mcp: FastMCP) -> None:
         _validate_volume_name(volume_name)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         logger.info("AUDIT: Removing volume %r on endpoint %d", volume_name, eid)
         await client.delete(
             f"/api/endpoints/{eid}/docker/volumes/{volume_name}",
             params={"force": "true" if force else "false"},
         )
-        return json.dumps({"status": "removed", "volume_name": volume_name})
+        return json.dumps(
+            {"status": "removed", "volume_name": volume_name}, ensure_ascii=False
+        )

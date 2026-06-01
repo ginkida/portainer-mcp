@@ -4,12 +4,13 @@ import asyncio
 import json
 import logging
 import re
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
 from ..config import get_config
-from ..errors import tool_error_handler
+from ..errors import redact_secrets, resolve_endpoint, tool_error_handler
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,18 @@ _CONTAINER_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,127}$")
 # do not allow dots, so neither should we when accepting one as input.
 _STACK_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}$")
 _MAX_LOG_CHARS = 100_000
+
+# Bounds for the multi-container scan helpers: cap how many containers a single
+# call will touch, and how many of those run concurrently, so a huge stack can't
+# exhaust the connection pool / Docker host or stall every other tool.
+_STACK_FANOUT_LIMIT = 10
+_MAX_STACK_TARGETS = 500
+
+# Hard limits for the user-supplied regex in logs_grep. A pathological pattern
+# can backtrack catastrophically (ReDoS); we cap its length and run the scan in
+# a worker thread under an overall deadline so it can never wedge the event loop.
+_MAX_GREP_PATTERN_CHARS = 512
+_GREP_SCAN_TIMEOUT = 5.0
 
 _ERROR_LINE_RE = re.compile(
     r"(?:"
@@ -97,7 +110,7 @@ def register(mcp: FastMCP) -> None:
         """
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         params = {"all": "true" if show_all else "false"}
         containers = await client.get(
             f"/api/endpoints/{eid}/docker/containers/json",
@@ -113,7 +126,7 @@ def register(mcp: FastMCP) -> None:
                 "status": c.get("Status"),
                 "created": c.get("Created"),
             })
-        return json.dumps(result, indent=2)
+        return json.dumps(result, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -130,11 +143,11 @@ def register(mcp: FastMCP) -> None:
         _validate_container_id(container_id)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         data = await client.get(
             f"/api/endpoints/{eid}/docker/containers/{container_id}/json",
         )
-        return json.dumps(data, indent=2)
+        return json.dumps(data, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -151,11 +164,13 @@ def register(mcp: FastMCP) -> None:
         _validate_container_id(container_id)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         await client.post(
             f"/api/endpoints/{eid}/docker/containers/{container_id}/start",
         )
-        return json.dumps({"status": "started", "container_id": container_id})
+        return json.dumps(
+            {"status": "started", "container_id": container_id}, ensure_ascii=False
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -172,11 +187,13 @@ def register(mcp: FastMCP) -> None:
         _validate_container_id(container_id)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         await client.post(
             f"/api/endpoints/{eid}/docker/containers/{container_id}/stop",
         )
-        return json.dumps({"status": "stopped", "container_id": container_id})
+        return json.dumps(
+            {"status": "stopped", "container_id": container_id}, ensure_ascii=False
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -193,11 +210,13 @@ def register(mcp: FastMCP) -> None:
         _validate_container_id(container_id)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         await client.post(
             f"/api/endpoints/{eid}/docker/containers/{container_id}/restart",
         )
-        return json.dumps({"status": "restarted", "container_id": container_id})
+        return json.dumps(
+            {"status": "restarted", "container_id": container_id}, ensure_ascii=False
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -216,7 +235,7 @@ def register(mcp: FastMCP) -> None:
         _validate_container_id(container_id)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         logger.info(
             "AUDIT: Removing container %s (force=%s) on endpoint %d",
             container_id, force, eid,
@@ -225,7 +244,9 @@ def register(mcp: FastMCP) -> None:
             f"/api/endpoints/{eid}/docker/containers/{container_id}",
             params={"force": "true" if force else "false"},
         )
-        return json.dumps({"status": "removed", "container_id": container_id})
+        return json.dumps(
+            {"status": "removed", "container_id": container_id}, ensure_ascii=False
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -245,11 +266,12 @@ def register(mcp: FastMCP) -> None:
         tail = max(1, min(tail, 1000))
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         resp = await client.request(
             "GET",
             f"/api/endpoints/{eid}/docker/containers/{container_id}/logs",
             params={"stdout": "true", "stderr": "true", "tail": str(tail)},
+            timeout=config.long_timeout,
         )
         output = _parse_docker_stream(resp.content)
         if len(output) > _MAX_LOG_CHARS:
@@ -281,6 +303,10 @@ def register(mcp: FastMCP) -> None:
         _validate_container_id(container_id)
         tail = max(1, min(tail, 1000))
         context_lines = max(0, min(context_lines, 5))
+        if len(pattern) > _MAX_GREP_PATTERN_CHARS:
+            raise ValueError(
+                f"Regex pattern too long (max {_MAX_GREP_PATTERN_CHARS} chars)"
+            )
         try:
             regex = re.compile(pattern, re.IGNORECASE)
         except re.error as exc:
@@ -288,16 +314,30 @@ def register(mcp: FastMCP) -> None:
 
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         resp = await client.request(
             "GET",
             f"/api/endpoints/{eid}/docker/containers/{container_id}/logs",
             params={"stdout": "true", "stderr": "true", "tail": str(tail)},
+            timeout=config.long_timeout,
         )
         text = _parse_docker_stream(resp.content)
         lines = text.splitlines()
 
-        hit_indices = [i for i, line in enumerate(lines) if regex.search(line)]
+        # A user-supplied regex can backtrack catastrophically. Run the whole
+        # scan in a worker thread under a hard deadline so a pathological
+        # pattern can never block the event loop / freeze the server.
+        def _scan(buf: list[str]) -> list[int]:
+            return [i for i, line in enumerate(buf) if regex.search(line)]
+
+        try:
+            hit_indices = await asyncio.wait_for(
+                asyncio.to_thread(_scan, lines), timeout=_GREP_SCAN_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            raise ValueError(
+                "Regex search timed out (pattern too complex for this log volume)"
+            ) from None
 
         if context_lines > 0 and hit_indices:
             visible: set[int] = set()
@@ -351,7 +391,7 @@ def register(mcp: FastMCP) -> None:
 
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
 
         containers = await client.get(
             f"/api/endpoints/{eid}/docker/containers/json",
@@ -373,26 +413,47 @@ def register(mcp: FastMCP) -> None:
                 "containers_scanned": 0,
                 "total_errors": 0,
                 "message": f"No running containers found for stack '{stack_name}'",
-            })
+            }, ensure_ascii=False)
+
+        if len(targets) > _MAX_STACK_TARGETS:
+            logger.warning(
+                "Stack %r has %d containers; scanning only the first %d",
+                stack_name, len(targets), _MAX_STACK_TARGETS,
+            )
+            targets = targets[:_MAX_STACK_TARGETS]
+
+        # Bound concurrency so a large stack can't exhaust the connection pool.
+        sem = asyncio.Semaphore(_STACK_FANOUT_LIMIT)
 
         async def _fetch_errors(cid: str, name: str) -> tuple[str, str, int, list[str]]:
-            resp = await client.request(
-                "GET",
-                f"/api/endpoints/{eid}/docker/containers/{cid}/logs",
-                params={"stdout": "true", "stderr": "true", "tail": str(tail)},
-            )
-            text = _parse_docker_stream(resp.content)
-            all_lines = text.splitlines()
-            errors = [ln for ln in all_lines if _ERROR_LINE_RE.search(ln)]
-            return name, cid, len(all_lines), errors
+            async with sem:
+                resp = await client.request(
+                    "GET",
+                    f"/api/endpoints/{eid}/docker/containers/{cid}/logs",
+                    params={"stdout": "true", "stderr": "true", "tail": str(tail)},
+                    timeout=config.long_timeout,
+                )
+                text = _parse_docker_stream(resp.content)
+                all_lines = text.splitlines()
+                errors = [ln for ln in all_lines if _ERROR_LINE_RE.search(ln)]
+                return name, cid, len(all_lines), errors
 
+        # return_exceptions=True so one container's failure yields partial
+        # results instead of aborting the whole scan.
         results = await asyncio.gather(
             *[_fetch_errors(cid, name) for cid, name in targets],
+            return_exceptions=True,
         )
 
         container_results = {}
         total_errors = 0
-        for name, cid, lines_scanned, errors in results:
+        failed = 0
+        for result in results:
+            if isinstance(result, BaseException):
+                failed += 1
+                logger.warning("Failed to fetch logs for a container: %s", result)
+                continue
+            name, cid, lines_scanned, errors = result
             total_errors += len(errors)
             container_results[name] = {
                 "container_id": cid,
@@ -404,7 +465,8 @@ def register(mcp: FastMCP) -> None:
         output = json.dumps(
             {
                 "stack": stack_name,
-                "containers_scanned": len(targets),
+                "containers_scanned": len(container_results),
+                "containers_failed": failed,
                 "total_errors": total_errors,
                 "containers": container_results,
             },
@@ -442,7 +504,7 @@ def register(mcp: FastMCP) -> None:
 
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
 
         containers = await client.get(
             f"/api/endpoints/{eid}/docker/containers/json",
@@ -463,9 +525,20 @@ def register(mcp: FastMCP) -> None:
                 "stack": stack_name,
                 "containers_scanned": 0,
                 "message": f"No running containers found for stack '{stack_name}'",
-            })
+            }, ensure_ascii=False)
+
+        if len(targets) > _MAX_STACK_TARGETS:
+            logger.warning(
+                "Stack %r has %d containers; scanning only the first %d",
+                stack_name, len(targets), _MAX_STACK_TARGETS,
+            )
+            targets = targets[:_MAX_STACK_TARGETS]
 
         log_path = "/var/www/app/storage/logs/laravel.log"
+
+        # Bound concurrency: each target costs two API calls plus an in-container
+        # shell, so an unbounded fan-out over a big stack could overwhelm the host.
+        sem = asyncio.Semaphore(_STACK_FANOUT_LIMIT)
 
         async def _fetch_laravel_errors(
             cid: str, name: str,
@@ -482,20 +555,24 @@ def register(mcp: FastMCP) -> None:
                 "AttachStderr": True,
                 "Cmd": ["sh", "-c", cmd],
             }
-            try:
-                exec_resp = await client.post(
-                    f"/api/endpoints/{eid}/docker/containers/{cid}/exec",
-                    json=exec_body,
-                )
-                exec_id = exec_resp["Id"]
-                start_resp = await client.request(
-                    "POST",
-                    f"/api/endpoints/{eid}/docker/exec/{exec_id}/start",
-                    json={"Detach": False, "Tty": False},
-                )
-                output = _parse_docker_stream(start_resp.content)
-            except Exception as exc:
-                output = f"exec failed: {exc}"
+            async with sem:
+                try:
+                    exec_resp = await client.post(
+                        f"/api/endpoints/{eid}/docker/containers/{cid}/exec",
+                        json=exec_body,
+                    )
+                    exec_id = exec_resp["Id"]
+                    start_resp = await client.request(
+                        "POST",
+                        f"/api/endpoints/{eid}/docker/exec/{exec_id}/start",
+                        json={"Detach": False, "Tty": False},
+                        timeout=config.long_timeout,
+                    )
+                    output = _parse_docker_stream(start_resp.content)
+                except Exception:
+                    # Keep details out of the tool output; log them server-side.
+                    logger.exception("laravel_errors exec failed for %s", name)
+                    output = "exec failed"
             return name, cid, output
 
         results = await asyncio.gather(
@@ -551,7 +628,7 @@ def register(mcp: FastMCP) -> None:
 
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
 
         containers = await client.get(
             f"/api/endpoints/{eid}/docker/containers/json",
@@ -574,11 +651,11 @@ def register(mcp: FastMCP) -> None:
         if not target_id:
             return json.dumps({
                 "error": f"No running backend container found for stack '{stack_name}'",
-            })
+            }, ensure_ascii=False)
 
         logger.info(
             "AUDIT: Laravel tinker in %s (%s) on endpoint %d: %s",
-            target_name, target_id, eid, code[:200],
+            target_name, target_id, eid, redact_secrets(code[:200]),
         )
 
         # Escape single quotes in code for safe shell embedding
@@ -601,6 +678,7 @@ def register(mcp: FastMCP) -> None:
             "POST",
             f"/api/endpoints/{eid}/docker/exec/{exec_id}/start",
             json={"Detach": False, "Tty": False},
+            timeout=config.long_timeout,
         )
         output = _parse_docker_stream(start_resp.content)
 
@@ -638,7 +716,7 @@ def register(mcp: FastMCP) -> None:
         _validate_container_id(container_id)
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         resp = await client.request(
             "GET",
             f"/api/endpoints/{eid}/docker/containers/{container_id}/stats",
@@ -690,7 +768,7 @@ def register(mcp: FastMCP) -> None:
             "block_read_mb": _mb(blk_read),
             "block_write_mb": _mb(blk_write),
             "pids": s.get("pids_stats", {}).get("current", 0),
-        }, indent=2)
+        }, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -715,14 +793,14 @@ def register(mcp: FastMCP) -> None:
             raise ValueError("Command too long (max 4096 chars)")
         client = get_client()
         config = get_config()
-        eid = config.default_endpoint if endpoint_id is None else endpoint_id
+        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         logger.info(
             "AUDIT: Exec in container %s on endpoint %d: %s",
-            container_id, eid, command[:200],
+            container_id, eid, redact_secrets(command[:200]),
         )
 
         # Step 1: Create exec instance
-        exec_body: dict = {
+        exec_body: dict[str, Any] = {
             "AttachStdout": True,
             "AttachStderr": True,
             "Cmd": ["sh", "-c", command],
@@ -743,6 +821,7 @@ def register(mcp: FastMCP) -> None:
             "POST",
             f"/api/endpoints/{eid}/docker/exec/{exec_id}/start",
             json={"Detach": False, "Tty": False},
+            timeout=config.long_timeout,
         )
 
         output = _parse_docker_stream(start_resp.content)
@@ -759,4 +838,4 @@ def register(mcp: FastMCP) -> None:
         return json.dumps({
             "exit_code": exit_code,
             "output": output,
-        }, indent=2)
+        }, indent=2, ensure_ascii=False)
