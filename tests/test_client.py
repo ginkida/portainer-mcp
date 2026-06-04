@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 
 import httpx
 import pytest
 
-from portainer_mcp.client import _MAX_RESPONSE_BYTES, PortainerClient
+import portainer_mcp.client as client_mod
+from portainer_mcp.client import _MAX_RESPONSE_BYTES, PortainerClient, close_client
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -210,3 +212,145 @@ def test_enforce_response_size_rejects_oversized() -> None:
         httpx.Response(200, headers={"content-length": "100"})
     )
     PortainerClient._enforce_response_size(httpx.Response(200))
+
+
+def test_enforce_response_size_checks_buffered_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chunked responses carry no content-length; the actual body size must
+    still be enforced once buffered."""
+    monkeypatch.setattr(client_mod, "_MAX_RESPONSE_BYTES", 10)
+    with pytest.raises(ValueError):
+        PortainerClient._enforce_response_size(httpx.Response(200, content=b"x" * 11))
+    PortainerClient._enforce_response_size(httpx.Response(200, content=b"x" * 10))
+
+
+async def test_401_then_403_csrf_does_not_chain_retries() -> None:
+    """A 403-CSRF on the 401-retry response must NOT trigger a second re-auth
+    and a third send — one retry per request(), whatever the cause."""
+    calls = {"auth": 0, "data": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth":
+            calls["auth"] += 1
+            return httpx.Response(200, json={"jwt": f"JWT{calls['auth']}"})
+        if request.url.path == "/api/status":
+            return httpx.Response(200, json={}, headers={"X-CSRF-Token": "C1"})
+        calls["data"] += 1
+        if calls["data"] == 1:
+            return httpx.Response(401, text="unauthorized")
+        return httpx.Response(403, text="invalid CSRF token")
+
+    client = build_client(handler)
+    try:
+        with pytest.raises(httpx.HTTPStatusError) as excinfo:
+            await client.post("/api/stacks/1/start")
+    finally:
+        await client.close()
+
+    assert excinfo.value.response.status_code == 403
+    assert calls["auth"] == 2  # initial + the single 401 re-auth
+    assert calls["data"] == 2  # original + one retry, no third send
+
+
+async def test_non_csrf_403_raises_without_reauth() -> None:
+    calls = {"auth": 0, "data": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth":
+            calls["auth"] += 1
+            return httpx.Response(200, json={"jwt": "JWT1"})
+        if request.url.path == "/api/status":
+            return httpx.Response(200, json={}, headers={"X-CSRF-Token": "C1"})
+        calls["data"] += 1
+        return httpx.Response(403, text="access denied")
+
+    client = build_client(handler)
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.get("/api/endpoints")
+    finally:
+        await client.close()
+
+    assert calls["auth"] == 1  # RBAC 403 is not an auth problem
+    assert calls["data"] == 1
+
+
+async def test_empty_200_body_returns_none_on_all_verbs() -> None:
+    """Some Portainer/Docker endpoints return 200 with an empty body (e.g.
+    network connect); that must not surface as a JSON decode error."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bootstrap = _auth_ok(request)
+        if bootstrap is not None:
+            return bootstrap
+        return httpx.Response(200, content=b"")
+
+    client = build_client(handler)
+    try:
+        assert await client.get("/api/x") is None
+        assert await client.post("/api/x") is None
+        assert await client.put("/api/x") is None
+        assert await client.delete("/api/x") is None
+    finally:
+        await client.close()
+
+
+async def test_jwt_ttl_proactive_refresh() -> None:
+    """A stale JWT must be refreshed proactively, without waiting for a 401."""
+    calls = {"auth": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth":
+            calls["auth"] += 1
+            return httpx.Response(200, json={"jwt": f"JWT{calls['auth']}"})
+        if request.url.path == "/api/status":
+            return httpx.Response(200, json={}, headers={"X-CSRF-Token": "C1"})
+        return httpx.Response(200, json={"ok": True})
+
+    client = build_client(handler)
+    try:
+        await client.get("/api/read")
+        assert calls["auth"] == 1
+        # Age the token past the TTL; the next call must re-auth proactively.
+        client._jwt_obtained_at = time.monotonic() - client._jwt_ttl - 1
+        await client.get("/api/read")
+    finally:
+        await client.close()
+
+    assert calls["auth"] == 2
+    assert client._auth_version == 2
+
+
+async def test_csrf_token_captured_from_ordinary_response() -> None:
+    """_capture_csrf must latch a token off any successful response, not just
+    the 401/403 retry paths."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bootstrap = _auth_ok(request)
+        if bootstrap is not None:
+            return bootstrap
+        return httpx.Response(200, json={}, headers={"X-CSRF-Token": "CNEW"})
+
+    client = build_client(handler)
+    try:
+        await client.get("/api/read")
+    finally:
+        await client.close()
+
+    assert client._csrf_token == "CNEW"
+
+
+async def test_close_client_closes_and_resets_singleton() -> None:
+    closed = {"flag": False}
+
+    class _Stub:
+        async def close(self) -> None:
+            closed["flag"] = True
+
+    client_mod._client = _Stub()  # type: ignore[assignment]
+    await close_client()
+    assert closed["flag"] is True
+    assert client_mod._client is None
+    # No-op when there is nothing to close.
+    await close_client()

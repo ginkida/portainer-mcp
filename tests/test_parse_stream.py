@@ -40,3 +40,35 @@ def test_truncated_trailing_frame_best_effort() -> None:
 
 def test_non_ascii_payload_preserved() -> None:
     assert _parse_docker_stream(_frame("Ошибка\n".encode())) == "Ошибка\n"
+
+
+def test_truncated_first_frame_drops_header_bytes() -> None:
+    # A single frame whose header promises more bytes than exist: the payload
+    # tail must be returned WITHOUT the 8 binary header bytes leaking through.
+    raw = bytes([1, 0, 0, 0]) + (100).to_bytes(4, "big") + b"partial"
+    assert _parse_docker_stream(raw) == "partial"
+
+
+def test_zero_length_frame_skipped() -> None:
+    assert _parse_docker_stream(_frame(b"") + _frame(b"data\n")) == "data\n"
+
+
+def test_implausible_header_falls_back_to_plain_decode() -> None:
+    # First byte is a valid stream type but the padding bytes are non-zero —
+    # not a multiplexed header, so the whole buffer is plain text.
+    raw = bytes([1, 7, 7, 7]) + b"not a frame"
+    assert _parse_docker_stream(raw) == raw.decode()
+
+
+def test_plaintext_tail_after_valid_frames_preserved() -> None:
+    # A valid frame followed by non-frame bytes: the tail is decoded as text
+    # rather than silently dropped.
+    out = _parse_docker_stream(_frame(b"ok\n") + b"plain tail")
+    assert out == "ok\nplain tail"
+
+
+def test_mid_header_tail_after_valid_frame_dropped() -> None:
+    # Fewer than 8 trailing bytes can't be a header; with frames already
+    # decoded the fragment is dropped (it's binary header debris, not text).
+    out = _parse_docker_stream(_frame(b"ok\n") + bytes([1, 0]))
+    assert "ok\n" in out

@@ -10,7 +10,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
 from ..config import get_config
-from ..errors import redact_secrets, resolve_endpoint, tool_error_handler
+from ..errors import redact_secrets, resolve_endpoint, tool_error_handler, validate_filter
 
 logger = logging.getLogger(__name__)
 
@@ -59,31 +59,36 @@ def _validate_container_id(container_id: str) -> None:
 def _parse_docker_stream(raw: bytes) -> str:
     """Parse Docker multiplexed stream (8-byte header per frame).
 
-    Falls back to a plain UTF-8 decode of the whole buffer when no frames can
-    be parsed (e.g. responses from non-TTY exec without multiplexing).
-    Truncated trailing frames are decoded best-effort and a debug log emitted.
+    A frame header is ``[stream_type, 0, 0, 0, size(4 bytes, big-endian)]``
+    with stream_type in {0: stdin, 1: stdout, 2: stderr}. Headers are validated
+    for plausibility so a non-multiplexed plain-text response (e.g. TTY exec)
+    is decoded as-is instead of having bytes misread as frame headers, and a
+    truncated first frame yields its payload tail rather than leaking the
+    8 binary header bytes into the output.
     """
     lines: list[str] = []
     i = 0
     n = len(raw)
     while i < n:
         if i + 8 > n:
-            logger.debug(
-                "Docker stream ended mid-header at byte %d/%d", i, n,
-            )
-            break
-        size = int.from_bytes(raw[i + 4 : i + 8], "big")
-        i += 8
-        if size <= 0:
-            continue
-        if i + size > n:
-            # Either the stream was truncated mid-frame, or the buffer isn't
-            # multiplexed at all and we just misread random bytes as a header.
-            # If we've already decoded at least one frame, treat as truncation;
-            # otherwise fall back to a plain decode of the whole buffer so we
-            # don't silently drop the first 8 bytes of plain text.
             if not lines:
                 return raw.decode("utf-8", errors="replace")
+            logger.debug("Docker stream ended mid-header at byte %d/%d", i, n)
+            break
+        header = raw[i : i + 8]
+        if header[0] not in (0, 1, 2) or header[1:4] != b"\x00\x00\x00":
+            # Not a multiplexed frame header: plain text from a TTY response.
+            if not lines:
+                return raw.decode("utf-8", errors="replace")
+            lines.append(raw[i:].decode("utf-8", errors="replace"))
+            break
+        size = int.from_bytes(header[4:8], "big")
+        i += 8
+        if size == 0:
+            continue
+        if i + size > n:
+            # Plausible header but the payload was cut short (transport
+            # truncation): decode the partial payload best-effort.
             logger.debug(
                 "Docker stream truncated frame: need %d bytes, have %d",
                 size, n - i,
@@ -92,7 +97,57 @@ def _parse_docker_stream(raw: bytes) -> str:
             break
         lines.append(raw[i : i + size].decode("utf-8", errors="replace"))
         i += size
-    return "".join(lines) if lines else raw.decode("utf-8", errors="replace")
+    return "".join(lines)
+
+
+def _stack_targets(
+    containers: list[dict[str, Any]],
+    stack_name: str,
+    service: str | None = None,
+) -> list[tuple[str, str]]:
+    """Find ``(short_id, short_name)`` for running containers of a stack.
+
+    Without ``service``, matches any container named ``/{stack}_...``. With
+    ``service``, matches that service across naming schemes: exact
+    ``/{stack}_{service}`` (plain ``docker run`` / Compose), Swarm replicas
+    ``/{stack}_{service}.1.task-id`` and Compose v1 ``/{stack}_{service}_1``.
+    The Compose-v1 underscore suffix must be all digits — otherwise sibling
+    services like ``{service}_worker`` would be misidentified as ``{service}``.
+    """
+    base = f"/{stack_name}_{service}" if service else f"/{stack_name}_"
+    targets: list[tuple[str, str]] = []
+    for c in containers:
+        for name in c.get("Names", []):
+            if service:
+                matched = (
+                    name == base
+                    or name.startswith(base + ".")
+                    or (
+                        name.startswith(base + "_")
+                        and name[len(base) + 1 :].isdigit()
+                    )
+                )
+            else:
+                matched = name.startswith(base)
+            if matched:
+                targets.append((c["Id"][:12], name[1:].rsplit(".", 1)[0]))
+                break
+    return targets
+
+
+def _cap_lines(lines: list[str], budget: int) -> tuple[list[str], bool]:
+    """Trim ``lines`` so their combined size fits ``budget`` characters.
+
+    Data is capped *before* JSON serialization so the tool output stays valid
+    JSON (slicing a serialized document would cut mid-string). Returns the
+    kept lines and whether anything was dropped.
+    """
+    total = 0
+    for idx, line in enumerate(lines):
+        total += len(line) + 1
+        if total > budget:
+            return lines[:idx], True
+    return lines, False
 
 
 def register(mcp: FastMCP) -> None:
@@ -101,17 +156,23 @@ def register(mcp: FastMCP) -> None:
     async def portainer_containers_list(
         endpoint_id: int | None = None,
         show_all: bool = False,
+        name_filter: str | None = None,
     ) -> str:
         """List containers on an endpoint.
 
         Args:
             endpoint_id: Target endpoint ID (uses default if omitted)
             show_all: If true, show all containers including stopped ones
+            name_filter: Only return containers whose name contains this
+                substring (server-side Docker filter)
         """
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         params = {"all": "true" if show_all else "false"}
+        if name_filter is not None:
+            validate_filter(name_filter, "name_filter")
+            params["filters"] = json.dumps({"name": [name_filter]})
         containers = await client.get(
             f"/api/endpoints/{eid}/docker/containers/json",
             params=params,
@@ -165,11 +226,13 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
+        logger.info("AUDIT: Starting container %s on endpoint %d", container_id, eid)
         await client.post(
             f"/api/endpoints/{eid}/docker/containers/{container_id}/start",
         )
         return json.dumps(
-            {"status": "started", "container_id": container_id}, ensure_ascii=False
+            {"status": "started", "container_id": container_id},
+            indent=2, ensure_ascii=False,
         )
 
     @mcp.tool()
@@ -188,11 +251,13 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
+        logger.info("AUDIT: Stopping container %s on endpoint %d", container_id, eid)
         await client.post(
             f"/api/endpoints/{eid}/docker/containers/{container_id}/stop",
         )
         return json.dumps(
-            {"status": "stopped", "container_id": container_id}, ensure_ascii=False
+            {"status": "stopped", "container_id": container_id},
+            indent=2, ensure_ascii=False,
         )
 
     @mcp.tool()
@@ -211,11 +276,13 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
+        logger.info("AUDIT: Restarting container %s on endpoint %d", container_id, eid)
         await client.post(
             f"/api/endpoints/{eid}/docker/containers/{container_id}/restart",
         )
         return json.dumps(
-            {"status": "restarted", "container_id": container_id}, ensure_ascii=False
+            {"status": "restarted", "container_id": container_id},
+            indent=2, ensure_ascii=False,
         )
 
     @mcp.tool()
@@ -245,7 +312,8 @@ def register(mcp: FastMCP) -> None:
             params={"force": "true" if force else "false"},
         )
         return json.dumps(
-            {"status": "removed", "container_id": container_id}, ensure_ascii=False
+            {"status": "removed", "container_id": container_id},
+            indent=2, ensure_ascii=False,
         )
 
     @mcp.tool()
@@ -274,9 +342,21 @@ def register(mcp: FastMCP) -> None:
             timeout=config.long_timeout,
         )
         output = _parse_docker_stream(resp.content)
-        if len(output) > _MAX_LOG_CHARS:
-            output = output[:_MAX_LOG_CHARS] + f"\n... truncated ({len(output)} total chars)"
-        return output
+        total_chars = len(output)
+        truncated = total_chars > _MAX_LOG_CHARS
+        if truncated:
+            output = output[:_MAX_LOG_CHARS]
+        return json.dumps(
+            {
+                "container_id": container_id,
+                "tail": tail,
+                "truncated": truncated,
+                "total_chars": total_chars,
+                "logs": output,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -351,20 +431,20 @@ def register(mcp: FastMCP) -> None:
         else:
             output_lines = [lines[i] for i in hit_indices]
 
-        result = json.dumps(
+        # Cap the data before serializing so the envelope stays valid JSON.
+        output_lines, truncated = _cap_lines(output_lines, _MAX_LOG_CHARS)
+        return json.dumps(
             {
                 "container_id": container_id,
                 "pattern": pattern,
                 "lines_scanned": len(lines),
                 "matches_found": len(hit_indices),
+                "truncated": truncated,
                 "lines": output_lines,
             },
             indent=2,
             ensure_ascii=False,
         )
-        if len(result) > _MAX_LOG_CHARS:
-            result = result[:_MAX_LOG_CHARS] + "\n... truncated"
-        return result
 
     @mcp.tool()
     @tool_error_handler
@@ -397,15 +477,7 @@ def register(mcp: FastMCP) -> None:
             f"/api/endpoints/{eid}/docker/containers/json",
             params={"all": "false"},
         )
-
-        prefix = f"/{stack_name}_"
-        targets: list[tuple[str, str]] = []
-        for c in containers:
-            for name in c.get("Names", []):
-                if name.startswith(prefix):
-                    short = name[1:].rsplit(".", 1)[0]
-                    targets.append((c["Id"][:12], short))
-                    break
+        targets = _stack_targets(containers, stack_name)
 
         if not targets:
             return json.dumps({
@@ -413,7 +485,7 @@ def register(mcp: FastMCP) -> None:
                 "containers_scanned": 0,
                 "total_errors": 0,
                 "message": f"No running containers found for stack '{stack_name}'",
-            }, ensure_ascii=False)
+            }, indent=2, ensure_ascii=False)
 
         if len(targets) > _MAX_STACK_TARGETS:
             logger.warning(
@@ -448,6 +520,10 @@ def register(mcp: FastMCP) -> None:
         container_results = {}
         total_errors = 0
         failed = 0
+        # First-come-first-served output budget across containers, applied to
+        # the data before serialization so the envelope stays valid JSON.
+        remaining = _MAX_LOG_CHARS
+        truncated = False
         for result in results:
             if isinstance(result, BaseException):
                 failed += 1
@@ -455,27 +531,28 @@ def register(mcp: FastMCP) -> None:
                 continue
             name, cid, lines_scanned, errors = result
             total_errors += len(errors)
+            kept, dropped = _cap_lines(errors, remaining)
+            remaining -= sum(len(ln) + 1 for ln in kept)
+            truncated = truncated or dropped
             container_results[name] = {
                 "container_id": cid,
                 "lines_scanned": lines_scanned,
                 "errors_found": len(errors),
-                "errors": errors,
+                "errors": kept,
             }
 
-        output = json.dumps(
+        return json.dumps(
             {
                 "stack": stack_name,
                 "containers_scanned": len(container_results),
                 "containers_failed": failed,
                 "total_errors": total_errors,
+                "truncated": truncated,
                 "containers": container_results,
             },
             indent=2,
             ensure_ascii=False,
         )
-        if len(output) > _MAX_LOG_CHARS:
-            output = output[:_MAX_LOG_CHARS] + "\n... truncated"
-        return output
 
     @mcp.tool()
     @tool_error_handler
@@ -510,22 +587,14 @@ def register(mcp: FastMCP) -> None:
             f"/api/endpoints/{eid}/docker/containers/json",
             params={"all": "false"},
         )
-
-        prefix = f"/{stack_name}_"
-        targets: list[tuple[str, str]] = []
-        for c in containers:
-            for name in c.get("Names", []):
-                if name.startswith(prefix):
-                    short = name[1:].rsplit(".", 1)[0]
-                    targets.append((c["Id"][:12], short))
-                    break
+        targets = _stack_targets(containers, stack_name)
 
         if not targets:
             return json.dumps({
                 "stack": stack_name,
                 "containers_scanned": 0,
                 "message": f"No running containers found for stack '{stack_name}'",
-            }, ensure_ascii=False)
+            }, indent=2, ensure_ascii=False)
 
         if len(targets) > _MAX_STACK_TARGETS:
             logger.warning(
@@ -535,6 +604,12 @@ def register(mcp: FastMCP) -> None:
             targets = targets[:_MAX_STACK_TARGETS]
 
         log_path = "/var/www/app/storage/logs/laravel.log"
+        # The exec command is a fixed read-only grep, but it still runs inside
+        # the containers — record the operation and its scope.
+        logger.info(
+            "AUDIT: laravel_errors grep exec for stack %r on endpoint %d (%d containers)",
+            stack_name, eid, len(targets),
+        )
 
         # Bound concurrency: each target costs two API calls plus an in-container
         # shell, so an unbounded fan-out over a big stack could overwhelm the host.
@@ -580,27 +655,31 @@ def register(mcp: FastMCP) -> None:
         )
 
         container_results = {}
+        # Same pre-serialization output budget as stack_logs_errors.
+        remaining = _MAX_LOG_CHARS
+        truncated = False
         for name, cid, output in results:
             lines = [ln for ln in output.splitlines() if ln.strip()]
+            kept, dropped = _cap_lines(lines, remaining)
+            remaining -= sum(len(ln) + 1 for ln in kept)
+            truncated = truncated or dropped
             container_results[name] = {
                 "container_id": cid,
                 "errors_found": len(lines),
-                "errors": lines,
+                "errors": kept,
             }
 
-        result = json.dumps(
+        return json.dumps(
             {
                 "stack": stack_name,
                 "containers_scanned": len(targets),
                 "log_path": log_path,
+                "truncated": truncated,
                 "containers": container_results,
             },
             indent=2,
             ensure_ascii=False,
         )
-        if len(result) > _MAX_LOG_CHARS:
-            result = result[:_MAX_LOG_CHARS] + "\n... truncated"
-        return result
 
     @mcp.tool()
     @tool_error_handler
@@ -635,27 +714,20 @@ def register(mcp: FastMCP) -> None:
             params={"all": "false"},
         )
 
-        # Find first running backend container for the stack
-        prefix = f"/{stack_name}_backend."
-        target_id: str | None = None
-        target_name: str | None = None
-        for c in containers:
-            for name in c.get("Names", []):
-                if name.startswith(prefix):
-                    target_id = c["Id"][:12]
-                    target_name = name[1:].rsplit(".", 1)[0]
-                    break
-            if target_id:
-                break
-
-        if not target_id:
+        # Find the first running backend container for the stack (matches
+        # Swarm, plain-Compose and Compose-v1 naming — see _stack_targets).
+        backends = _stack_targets(containers, stack_name, service="backend")
+        if not backends:
             return json.dumps({
                 "error": f"No running backend container found for stack '{stack_name}'",
-            }, ensure_ascii=False)
+            }, indent=2, ensure_ascii=False)
+        target_id, target_name = backends[0]
 
+        # Redact the full code before truncating the preview, so a secret
+        # split across the cut can never land in the log half-masked.
         logger.info(
             "AUDIT: Laravel tinker in %s (%s) on endpoint %d: %s",
-            target_name, target_id, eid, redact_secrets(code[:200]),
+            target_name, target_id, eid, redact_secrets(code)[:500],
         )
 
         # Escape single quotes in code for safe shell embedding
@@ -685,7 +757,8 @@ def register(mcp: FastMCP) -> None:
         inspect = await client.get(
             f"/api/endpoints/{eid}/docker/exec/{exec_id}/json",
         )
-        exit_code = inspect.get("ExitCode", -1)
+        # `or {}`: never lose the exec output over a flaky metadata read.
+        exit_code = (inspect or {}).get("ExitCode", -1)
 
         if len(output) > _MAX_LOG_CHARS:
             output = output[:_MAX_LOG_CHARS] + "\n... truncated"
@@ -721,19 +794,29 @@ def register(mcp: FastMCP) -> None:
             "GET",
             f"/api/endpoints/{eid}/docker/containers/{container_id}/stats",
             params={"stream": "false"},
+            # stream=false still waits for two CPU samples on the daemon side.
+            timeout=config.long_timeout,
         )
         s = resp.json()
 
         # CPU usage calculation
+        cpu_stats = s.get("cpu_stats", {})
+        precpu_stats = s.get("precpu_stats", {})
         cpu_delta = (
-            s.get("cpu_stats", {}).get("cpu_usage", {}).get("total_usage", 0)
-            - s.get("precpu_stats", {}).get("cpu_usage", {}).get("total_usage", 0)
+            cpu_stats.get("cpu_usage", {}).get("total_usage", 0)
+            - precpu_stats.get("cpu_usage", {}).get("total_usage", 0)
         )
         system_delta = (
-            s.get("cpu_stats", {}).get("system_cpu_usage", 0)
-            - s.get("precpu_stats", {}).get("system_cpu_usage", 0)
+            cpu_stats.get("system_cpu_usage", 0)
+            - precpu_stats.get("system_cpu_usage", 0)
         )
-        online_cpus = s.get("cpu_stats", {}).get("online_cpus", 1)
+        # Docker's canonical fallback chain: some daemons report
+        # online_cpus: 0 explicitly (cgroup v1), others omit it entirely.
+        online_cpus = (
+            cpu_stats.get("online_cpus")
+            or len(cpu_stats.get("cpu_usage", {}).get("percpu_usage") or [])
+            or 1
+        )
         cpu_percent = 0.0
         if system_delta > 0:
             cpu_percent = round((cpu_delta / system_delta) * online_cpus * 100, 2)
@@ -794,9 +877,11 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
+        # Redact the full command before truncating the preview, so a secret
+        # split across the cut can never land in the log half-masked.
         logger.info(
             "AUDIT: Exec in container %s on endpoint %d: %s",
-            container_id, eid, redact_secrets(command[:200]),
+            container_id, eid, redact_secrets(command)[:500],
         )
 
         # Step 1: Create exec instance
@@ -826,11 +911,12 @@ def register(mcp: FastMCP) -> None:
 
         output = _parse_docker_stream(start_resp.content)
 
-        # Step 3: Get exit code
+        # Step 3: Get exit code (`or {}`: never lose the exec output over a
+        # flaky metadata read)
         inspect = await client.get(
             f"/api/endpoints/{eid}/docker/exec/{exec_id}/json",
         )
-        exit_code = inspect.get("ExitCode", -1)
+        exit_code = (inspect or {}).get("ExitCode", -1)
 
         if len(output) > _MAX_LOG_CHARS:
             output = output[:_MAX_LOG_CHARS] + f"\n... truncated ({len(output)} total chars)"

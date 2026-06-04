@@ -30,6 +30,16 @@ def _validate_stack_name(name: str) -> None:
         )
 
 
+def _validate_compose_content(content: str) -> None:
+    if not content.strip():
+        raise ValueError("compose_content must not be empty")
+    if len(content) > _MAX_COMPOSE_CHARS:
+        raise ValueError(
+            f"compose_content too large ({len(content)} chars, "
+            f"max {_MAX_COMPOSE_CHARS})"
+        )
+
+
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
     @tool_error_handler
@@ -61,7 +71,7 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         stack = await client.get(f"/api/stacks/{stack_id}")
         try:
-            file_resp = await client.get(f"/api/stacks/{stack_id}/file")
+            file_resp = await client.get(f"/api/stacks/{stack_id}/file") or {}
             content = file_resp.get("StackFileContent", "")
             if len(content) > _MAX_COMPOSE_CHARS:
                 logger.warning(
@@ -93,6 +103,7 @@ def register(mcp: FastMCP) -> None:
             endpoint_id: Target endpoint ID (uses default if omitted)
         """
         _validate_stack_name(name)
+        _validate_compose_content(compose_content)
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
@@ -123,7 +134,9 @@ def register(mcp: FastMCP) -> None:
         )
         if result:
             return json.dumps(result, indent=2, ensure_ascii=False)
-        return json.dumps({"status": "deployed", "name": name}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "deployed", "name": name}, indent=2, ensure_ascii=False
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -137,16 +150,25 @@ def register(mcp: FastMCP) -> None:
         Args:
             stack_id: The ID of the stack to update
             compose_content: New Docker Compose content (YAML). If omitted, redeploys existing.
-            endpoint_id: Endpoint ID (uses default if omitted)
+            endpoint_id: Endpoint ID (derived from the stack itself if omitted)
         """
         validate_id(stack_id, "stack_id")
+        if compose_content is not None:
+            _validate_compose_content(compose_content)
         client = get_client()
         config = get_config()
-        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
+        if endpoint_id is None:
+            # Stacks are bound to one endpoint; deriving it from the stack
+            # itself avoids targeting the wrong endpoint in multi-endpoint
+            # setups where the default doesn't match.
+            stack = await client.get(f"/api/stacks/{stack_id}") or {}
+            eid = stack.get("EndpointId") or config.default_endpoint
+        else:
+            eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         logger.info("AUDIT: Updating stack %d on endpoint %d", stack_id, eid)
 
         if compose_content is None:
-            file_resp = await client.get(f"/api/stacks/{stack_id}/file")
+            file_resp = await client.get(f"/api/stacks/{stack_id}/file") or {}
             compose_content = file_resp.get("StackFileContent", "")
 
         body = {
@@ -160,7 +182,9 @@ def register(mcp: FastMCP) -> None:
         )
         if result:
             return json.dumps(result, indent=2, ensure_ascii=False)
-        return json.dumps({"status": "updated", "stack_id": stack_id}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "updated", "stack_id": stack_id}, indent=2, ensure_ascii=False
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -174,7 +198,9 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         logger.info("AUDIT: Deleting stack %d", stack_id)
         await client.delete(f"/api/stacks/{stack_id}")
-        return json.dumps({"status": "deleted", "stack_id": stack_id}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "deleted", "stack_id": stack_id}, indent=2, ensure_ascii=False
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -190,7 +216,9 @@ def register(mcp: FastMCP) -> None:
         result = await client.post(f"/api/stacks/{stack_id}/start")
         if result:
             return json.dumps(result, indent=2, ensure_ascii=False)
-        return json.dumps({"status": "started", "stack_id": stack_id}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "started", "stack_id": stack_id}, indent=2, ensure_ascii=False
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -206,4 +234,6 @@ def register(mcp: FastMCP) -> None:
         result = await client.post(f"/api/stacks/{stack_id}/stop")
         if result:
             return json.dumps(result, indent=2, ensure_ascii=False)
-        return json.dumps({"status": "stopped", "stack_id": stack_id}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "stopped", "stack_id": stack_id}, indent=2, ensure_ascii=False
+        )

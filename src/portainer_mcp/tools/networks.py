@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
 from ..config import get_config
-from ..errors import resolve_endpoint, tool_error_handler
+from ..errors import resolve_endpoint, tool_error_handler, validate_filter
 from .containers import _validate_container_id
 
 logger = logging.getLogger(__name__)
@@ -28,16 +28,27 @@ def _validate_network_name(name: str) -> None:
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
     @tool_error_handler
-    async def portainer_networks_list(endpoint_id: int | None = None) -> str:
+    async def portainer_networks_list(
+        endpoint_id: int | None = None,
+        name_filter: str | None = None,
+    ) -> str:
         """List Docker networks on an endpoint.
 
         Args:
             endpoint_id: Target endpoint ID (uses default if omitted)
+            name_filter: Only return networks whose name contains this
+                substring (server-side Docker filter)
         """
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
-        networks = await client.get(f"/api/endpoints/{eid}/docker/networks")
+        params: dict[str, str] = {}
+        if name_filter is not None:
+            validate_filter(name_filter, "name_filter")
+            params["filters"] = json.dumps({"name": [name_filter]})
+        networks = await client.get(
+            f"/api/endpoints/{eid}/docker/networks", params=params
+        )
         result = []
         for n in networks:
             result.append({
@@ -108,7 +119,9 @@ def register(mcp: FastMCP) -> None:
         )
         if data:
             return json.dumps(data, indent=2, ensure_ascii=False)
-        return json.dumps({"status": "created", "name": name}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "created", "name": name}, indent=2, ensure_ascii=False
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -130,7 +143,9 @@ def register(mcp: FastMCP) -> None:
         await client.delete(
             f"/api/endpoints/{eid}/docker/networks/{network_id}",
         )
-        return json.dumps({"status": "removed", "network_id": network_id}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "removed", "network_id": network_id}, indent=2, ensure_ascii=False
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -163,7 +178,7 @@ def register(mcp: FastMCP) -> None:
             "status": "connected",
             "network_id": network_id,
             "container_id": container_id,
-        }, ensure_ascii=False)
+        }, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -187,8 +202,8 @@ def register(mcp: FastMCP) -> None:
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         logger.info(
-            "AUDIT: Disconnecting container %s from network %s on endpoint %d",
-            container_id, network_id, eid,
+            "AUDIT: Disconnecting container %s from network %s (force=%s) on endpoint %d",
+            container_id, network_id, force, eid,
         )
         await client.post(
             f"/api/endpoints/{eid}/docker/networks/{network_id}/disconnect",
@@ -198,4 +213,4 @@ def register(mcp: FastMCP) -> None:
             "status": "disconnected",
             "network_id": network_id,
             "container_id": container_id,
-        }, ensure_ascii=False)
+        }, indent=2, ensure_ascii=False)

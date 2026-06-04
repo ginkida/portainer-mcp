@@ -25,11 +25,11 @@ _MAX_RESPONSE_BYTES = 50_000_000
 class PortainerClient:
     """HTTP client for the Portainer API with JWT authentication."""
 
-    # Proactively refresh JWT after 7 hours (Portainer default TTL is 8h)
-    _JWT_TTL = 7 * 3600
-
     def __init__(self) -> None:
         config = get_config()
+        # Proactively refresh the JWT before Portainer's session lifetime
+        # (default 8h) expires it server-side; see PORTAINER_JWT_TTL.
+        self._jwt_ttl = config.jwt_ttl
         self._jwt: str | None = None
         self._csrf_token: str | None = None
         self._jwt_obtained_at: float = 0
@@ -56,7 +56,7 @@ class PortainerClient:
     def _jwt_is_fresh(self) -> bool:
         return (
             self._jwt is not None
-            and time.monotonic() - self._jwt_obtained_at < self._JWT_TTL
+            and time.monotonic() - self._jwt_obtained_at < self._jwt_ttl
         )
 
     async def _do_authenticate(self) -> None:
@@ -116,10 +116,21 @@ class PortainerClient:
 
     @staticmethod
     def _enforce_response_size(resp: httpx.Response) -> None:
+        # NOTE: request() does not stream, so httpx has already buffered the
+        # whole body by the time this runs — the guard cannot prevent the
+        # memory spike of a huge chunked response. What it does guarantee is
+        # that an oversized payload is rejected before JSON parsing and before
+        # it can reach a tool result. The header check catches declared sizes;
+        # the content check catches chunked responses with no content-length.
         cl = resp.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
             raise ValueError(
                 f"Portainer response too large: {cl} bytes "
+                f"(max {_MAX_RESPONSE_BYTES})."
+            )
+        if len(resp.content) > _MAX_RESPONSE_BYTES:
+            raise ValueError(
+                f"Portainer response too large: {len(resp.content)} bytes "
                 f"(max {_MAX_RESPONSE_BYTES})."
             )
 
@@ -168,7 +179,10 @@ class PortainerClient:
             merged_headers = {**user_headers, **self._headers(method)}
             resp = await self._http.request(method, path, headers=merged_headers, **kwargs)
             await self._capture_csrf(resp)
-        if resp.status_code == 403 and "CSRF" in resp.text:
+        # `elif`, not `if`: the 403-CSRF branch must not chain off the 401-retry
+        # response, or a single request() could re-auth twice and send a
+        # mutating request three times. One retry per call, whatever the cause.
+        elif resp.status_code == 403 and "CSRF" in resp.text:
             logger.debug("CSRF token expired, refreshing")
             await self._refresh_auth(attempted_version)
             if method.upper() in _UNSAFE_METHODS:
@@ -185,30 +199,36 @@ class PortainerClient:
         resp.raise_for_status()
         return resp
 
-    async def get(self, path: str, **kwargs: Any) -> Any:
-        resp = await self.request("GET", path, **kwargs)
-        return resp.json()
+    @staticmethod
+    def _decode(resp: httpx.Response) -> Any:
+        """Decode a successful response body, tolerating empty/non-JSON bodies.
 
-    async def post(self, path: str, **kwargs: Any) -> Any:
-        resp = await self.request("POST", path, **kwargs)
-        if resp.status_code == 204:
-            return None
-        return resp.json()
-
-    async def put(self, path: str, **kwargs: Any) -> Any:
-        resp = await self.request("PUT", path, **kwargs)
-        if resp.status_code == 204:
-            return None
-        return resp.json()
-
-    async def delete(self, path: str, **kwargs: Any) -> Any:
-        resp = await self.request("DELETE", path, **kwargs)
-        if resp.status_code == 204:
+        Some Portainer/Docker endpoints return 200 with an empty body (e.g.
+        network connect/disconnect) — treating that as an error would report a
+        successful mutation as failed.
+        """
+        if resp.status_code == 204 or not resp.content:
             return None
         try:
             return resp.json()
         except (ValueError, httpx.DecodingError):
             return None
+
+    async def get(self, path: str, **kwargs: Any) -> Any:
+        resp = await self.request("GET", path, **kwargs)
+        return self._decode(resp)
+
+    async def post(self, path: str, **kwargs: Any) -> Any:
+        resp = await self.request("POST", path, **kwargs)
+        return self._decode(resp)
+
+    async def put(self, path: str, **kwargs: Any) -> Any:
+        resp = await self.request("PUT", path, **kwargs)
+        return self._decode(resp)
+
+    async def delete(self, path: str, **kwargs: Any) -> Any:
+        resp = await self.request("DELETE", path, **kwargs)
+        return self._decode(resp)
 
     async def close(self) -> None:
         await self._http.aclose()

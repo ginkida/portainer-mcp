@@ -200,6 +200,7 @@ mcpServers:
 | `PORTAINER_LONG_TIMEOUT` | No | `300` | Timeout (seconds) for long-running operations: image pull, container exec, large log scans |
 | `PORTAINER_HTTP_MAX_CONNECTIONS` | No | `100` | Max concurrent HTTP connections to Portainer |
 | `PORTAINER_HTTP_MAX_KEEPALIVE` | No | `20` | Max idle keep-alive connections |
+| `PORTAINER_JWT_TTL` | No | `25200` (7h) | Proactive JWT refresh interval (seconds). Set below Portainer's session timeout (default 8h) to avoid per-call 401 re-auth round-trips. |
 
 All values are validated at startup — a malformed URL, a non-numeric timeout, or a non-positive limit fails fast with a clear error instead of breaking later.
 
@@ -229,7 +230,7 @@ All 41 tools are listed below with their parameters and descriptions. Every tool
 | `portainer_stacks_list()` | List all stacks with id, name, type, status, endpoint_id. |
 | `portainer_stack_inspect(stack_id)` | Get stack details including the docker-compose file content. |
 | `portainer_stack_deploy(name, compose_content, endpoint_id?)` | Deploy a new stack. Auto-detects Swarm vs standalone. |
-| `portainer_stack_update(stack_id, compose_content?, endpoint_id?)` | Update a stack. Omit compose_content to redeploy existing. |
+| `portainer_stack_update(stack_id, compose_content?, endpoint_id?)` | Update a stack. Omit compose_content to redeploy existing. If `endpoint_id` is omitted, it is derived from the stack itself. |
 | `portainer_stack_delete(stack_id)` | Delete a stack. |
 | `portainer_stack_start(stack_id)` | Start a stopped stack. |
 | `portainer_stack_stop(stack_id)` | Stop a running stack. |
@@ -238,25 +239,25 @@ All 41 tools are listed below with their parameters and descriptions. Every tool
 
 | Tool | Description |
 |---|---|
-| `portainer_containers_list(endpoint_id?, show_all?)` | List containers. Set `show_all=true` to include stopped. |
+| `portainer_containers_list(endpoint_id?, show_all?, name_filter?)` | List containers. Set `show_all=true` to include stopped; `name_filter` applies a server-side Docker name filter. |
 | `portainer_container_inspect(container_id, endpoint_id?)` | Get detailed container info. |
 | `portainer_container_start(container_id, endpoint_id?)` | Start a stopped container. |
 | `portainer_container_stop(container_id, endpoint_id?)` | Stop a running container. |
 | `portainer_container_restart(container_id, endpoint_id?)` | Restart a container. |
 | `portainer_container_remove(container_id, force?, endpoint_id?)` | Remove a container. `force` defaults to false. |
-| `portainer_container_logs(container_id, tail?, endpoint_id?)` | Get container logs. `tail` defaults to 100 (max 1000). |
+| `portainer_container_logs(container_id, tail?, endpoint_id?)` | Get container logs as a JSON envelope (`logs`, `truncated`, `total_chars`). `tail` defaults to 100 (max 1000). |
 | `portainer_container_logs_grep(container_id, pattern, tail?, context_lines?, endpoint_id?)` | Server-side regex over logs. Returns only matching lines (with optional context) — saves bandwidth on noisy logs. |
 | `portainer_container_stats(container_id, endpoint_id?)` | Point-in-time CPU%, memory, network and block I/O stats (not a stream). |
 | `portainer_container_exec(container_id, command, workdir?, user?, endpoint_id?)` | Run a shell command inside a running container and return its stdout/stderr + exit code. Audit-logged. |
 | `portainer_stack_logs_errors(stack_name, tail?, endpoint_id?)` | Concurrent scan of every running container in a stack for HTTP 4xx/5xx, exceptions, fatal/critical levels, panics, OOM, PHP errors, etc. |
 | `portainer_laravel_errors(stack_name, tail?, endpoint_id?)` | Read `/var/www/app/storage/logs/laravel.log` inside each container of a stack and return `production.ERROR/CRITICAL/EMERGENCY` entries — the actual exception behind a 500. |
-| `portainer_laravel_tinker(stack_name, code, endpoint_id?)` | Execute PHP via `php artisan tinker --execute=...` in the first running `{stack}_backend.*` container. Code capped at 4096 chars. Audit-logged. |
+| `portainer_laravel_tinker(stack_name, code, endpoint_id?)` | Execute PHP via `php artisan tinker --execute=...` in the first running `{stack}_backend` container (Swarm, plain-Compose and Compose-v1 naming all matched). Code capped at 4096 chars. Audit-logged. |
 
 ### Images
 
 | Tool | Description |
 |---|---|
-| `portainer_images_list(endpoint_id?)` | List images with tags and sizes. |
+| `portainer_images_list(endpoint_id?, reference_filter?)` | List images with tags and sizes. `reference_filter` applies a server-side filter (e.g. `nginx:1.25`). |
 | `portainer_image_inspect(image_id, endpoint_id?)` | Get detailed image info. Accepts `name:tag` or `name@sha256:digest`. |
 | `portainer_image_pull(image_name, tag?, registry_auth?, endpoint_id?)` | Pull an image. `tag` defaults to `"latest"`. `registry_auth` is an optional base64-encoded JSON `{"username":..,"password":..,"serveraddress":..}` forwarded as `X-Registry-Auth` — required for private registries. The pull-progress stream is parsed and any `errorDetail` is surfaced as a tool error (the previous version returned success regardless). |
 | `portainer_image_remove(image_id, endpoint_id?)` | Remove an image. |
@@ -265,7 +266,7 @@ All 41 tools are listed below with their parameters and descriptions. Every tool
 
 | Tool | Description |
 |---|---|
-| `portainer_volumes_list(endpoint_id?)` | List Docker volumes. |
+| `portainer_volumes_list(endpoint_id?, name_filter?)` | List Docker volumes. `name_filter` applies a server-side name filter. |
 | `portainer_volume_inspect(volume_name, endpoint_id?)` | Get detailed volume info. |
 | `portainer_volume_create(name, driver?, labels?, endpoint_id?)` | Create a volume. `driver` defaults to `"local"`. |
 | `portainer_volume_remove(volume_name, force?, endpoint_id?)` | Remove a volume. `force` defaults to false. |
@@ -274,7 +275,7 @@ All 41 tools are listed below with their parameters and descriptions. Every tool
 
 | Tool | Description |
 |---|---|
-| `portainer_networks_list(endpoint_id?)` | List Docker networks with driver, scope and attached container count. |
+| `portainer_networks_list(endpoint_id?, name_filter?)` | List Docker networks with driver, scope and attached container count. `name_filter` applies a server-side name filter. |
 | `portainer_network_inspect(network_id, endpoint_id?)` | Get detailed network info. |
 | `portainer_network_create(name, driver?, internal?, labels?, endpoint_id?)` | Create a network. `driver` defaults to `"bridge"` (use `"overlay"` for Swarm). |
 | `portainer_network_remove(network_id, endpoint_id?)` | Remove a network. |

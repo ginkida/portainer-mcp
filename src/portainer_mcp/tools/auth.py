@@ -24,12 +24,13 @@ def register(mcp: FastMCP) -> None:
         # credential can never leak into the response.
         try:
             status = await client.get("/api/status")
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
             return json.dumps({
                 "connected": False,
                 "url": config.url,
                 "error": redact_secrets(str(exc)),
             }, indent=2, ensure_ascii=False)
+        status = status or {}
         return json.dumps({
             "connected": True,
             "url": config.url,

@@ -73,17 +73,26 @@ def _scan_pull_stream(text: str) -> list[str]:
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
     @tool_error_handler
-    async def portainer_images_list(endpoint_id: int | None = None) -> str:
+    async def portainer_images_list(
+        endpoint_id: int | None = None,
+        reference_filter: str | None = None,
+    ) -> str:
         """List Docker images on an endpoint.
 
         Args:
             endpoint_id: Target endpoint ID (uses default if omitted)
+            reference_filter: Only return images matching this reference
+                (e.g. 'nginx' or 'nginx:1.25'; server-side Docker filter)
         """
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
+        params: dict[str, str] = {}
+        if reference_filter is not None:
+            _validate_image_ref(reference_filter)
+            params["filters"] = json.dumps({"reference": [reference_filter]})
         images = await client.get(
-            f"/api/endpoints/{eid}/docker/images/json",
+            f"/api/endpoints/{eid}/docker/images/json", params=params
         )
         result = []
         for img in images:
@@ -175,7 +184,7 @@ def register(mcp: FastMCP) -> None:
         return json.dumps({
             "status": "pulled",
             "image": f"{image_name}:{tag}",
-        }, ensure_ascii=False)
+        }, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     @tool_error_handler
@@ -198,7 +207,9 @@ def register(mcp: FastMCP) -> None:
         await client.delete(
             f"/api/endpoints/{eid}/docker/images/{safe_id}",
         )
-        return json.dumps({"status": "removed", "image_id": image_id}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "removed", "image_id": image_id}, indent=2, ensure_ascii=False
+        )
 
 
 # Re-exported for callers that want to assemble the X-Registry-Auth header

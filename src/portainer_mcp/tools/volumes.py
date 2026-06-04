@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
 from ..config import get_config
-from ..errors import resolve_endpoint, tool_error_handler
+from ..errors import resolve_endpoint, tool_error_handler, validate_filter
 
 logger = logging.getLogger(__name__)
 
@@ -27,16 +27,27 @@ def _validate_volume_name(name: str) -> None:
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
     @tool_error_handler
-    async def portainer_volumes_list(endpoint_id: int | None = None) -> str:
+    async def portainer_volumes_list(
+        endpoint_id: int | None = None,
+        name_filter: str | None = None,
+    ) -> str:
         """List Docker volumes on an endpoint.
 
         Args:
             endpoint_id: Target endpoint ID (uses default if omitted)
+            name_filter: Only return volumes whose name contains this
+                substring (server-side Docker filter)
         """
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
-        data = await client.get(f"/api/endpoints/{eid}/docker/volumes")
+        params: dict[str, str] = {}
+        if name_filter is not None:
+            validate_filter(name_filter, "name_filter")
+            params["filters"] = json.dumps({"name": [name_filter]})
+        data = await client.get(
+            f"/api/endpoints/{eid}/docker/volumes", params=params
+        )
         volumes = data.get("Volumes") or []
         result = []
         for v in volumes:
@@ -101,7 +112,9 @@ def register(mcp: FastMCP) -> None:
         )
         if data:
             return json.dumps(data, indent=2, ensure_ascii=False)
-        return json.dumps({"status": "created", "name": name}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "created", "name": name}, indent=2, ensure_ascii=False
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -121,11 +134,13 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
-        logger.info("AUDIT: Removing volume %r on endpoint %d", volume_name, eid)
+        logger.info(
+            "AUDIT: Removing volume %r (force=%s) on endpoint %d", volume_name, force, eid
+        )
         await client.delete(
             f"/api/endpoints/{eid}/docker/volumes/{volume_name}",
             params={"force": "true" if force else "false"},
         )
         return json.dumps(
-            {"status": "removed", "volume_name": volume_name}, ensure_ascii=False
+            {"status": "removed", "volume_name": volume_name}, indent=2, ensure_ascii=False
         )

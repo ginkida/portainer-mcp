@@ -13,7 +13,13 @@ def test_defaults() -> None:
     assert cfg.long_timeout == 300.0
     assert cfg.http_max_connections == 100
     assert cfg.http_max_keepalive == 20
+    assert cfg.jwt_ttl == 7 * 3600.0
     assert cfg.verify_ssl is True
+
+
+def test_jwt_ttl_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PORTAINER_JWT_TTL", "3600")
+    assert Config().jwt_ttl == 3600.0
 
 
 def test_trailing_slash_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -58,17 +64,24 @@ def test_remote_http_warns(
     assert any("cleartext" in r.message for r in caplog.records)
 
 
-@pytest.mark.parametrize(
-    "var",
-    ["PORTAINER_TIMEOUT", "PORTAINER_LONG_TIMEOUT", "PORTAINER_HTTP_MAX_CONNECTIONS"],
+# One shared matrix so the four tuning vars can't drift apart again.
+_TUNING_VARS = (
+    "PORTAINER_TIMEOUT",
+    "PORTAINER_LONG_TIMEOUT",
+    "PORTAINER_HTTP_MAX_CONNECTIONS",
+    "PORTAINER_HTTP_MAX_KEEPALIVE",
+    "PORTAINER_JWT_TTL",
 )
+
+
+@pytest.mark.parametrize("var", _TUNING_VARS)
 def test_non_numeric_tuning_rejected(monkeypatch: pytest.MonkeyPatch, var: str) -> None:
     monkeypatch.setenv(var, "abc")
     with pytest.raises(ValueError, match=var):
         Config()
 
 
-@pytest.mark.parametrize("var", ["PORTAINER_TIMEOUT", "PORTAINER_HTTP_MAX_CONNECTIONS"])
+@pytest.mark.parametrize("var", _TUNING_VARS)
 def test_non_positive_tuning_rejected(monkeypatch: pytest.MonkeyPatch, var: str) -> None:
     monkeypatch.setenv(var, "0")
     with pytest.raises(ValueError, match="positive"):

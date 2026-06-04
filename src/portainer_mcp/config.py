@@ -67,6 +67,10 @@ class Config:
         self.long_timeout = _positive_float("PORTAINER_LONG_TIMEOUT", "300")
         self.http_max_connections = _positive_int("PORTAINER_HTTP_MAX_CONNECTIONS", "100")
         self.http_max_keepalive = _positive_int("PORTAINER_HTTP_MAX_KEEPALIVE", "20")
+        # Proactive JWT refresh interval. Must stay below Portainer's configured
+        # session lifetime (default 8h) or every call pays a 401 + re-auth
+        # round-trip once the server-side token expires first.
+        self.jwt_ttl = _positive_float("PORTAINER_JWT_TTL", str(7 * 3600))
 
         missing: list[str] = []
         if not self.url:
