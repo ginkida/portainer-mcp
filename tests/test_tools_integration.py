@@ -8,7 +8,16 @@ import pytest
 from mcp.server.fastmcp import FastMCP
 
 import portainer_mcp.client as client_mod
-from portainer_mcp.tools import auth, containers, images, networks, stacks, volumes
+from portainer_mcp.tools import (
+    auth,
+    containers,
+    endpoints,
+    images,
+    networks,
+    stacks,
+    users,
+    volumes,
+)
 
 
 def _frame(payload: bytes, stream_type: int = 1) -> bytes:
@@ -214,10 +223,7 @@ class _TinkerClient:
 
     async def get(self, path: str, **kwargs: Any) -> Any:
         if path.endswith("/containers/json"):
-            return [
-                {"Id": f"{i:012x}0000", "Names": [name]}
-                for i, name in enumerate(self.names)
-            ]
+            return [{"Id": f"{i:012x}0000", "Names": [name]} for i, name in enumerate(self.names)]
         if "/exec/" in path and path.endswith("/json"):
             return {"ExitCode": 0}
         raise AssertionError(f"unexpected GET {path}")
@@ -263,9 +269,7 @@ async def test_laravel_tinker_skips_sibling_services() -> None:
     """backend_worker / backend_horizon etc. must NOT be picked as 'backend'."""
     mcp = FastMCP("t")
     containers.register(mcp)
-    fake = _TinkerClient(
-        ["/demo_backend_worker_1", "/demo_backend_horizon.1.x", "/demo_backend_1"]
-    )
+    fake = _TinkerClient(["/demo_backend_worker_1", "/demo_backend_horizon.1.x", "/demo_backend_1"])
     client_mod._client = fake  # type: ignore[assignment]
     body = json.loads(
         _text(
@@ -343,11 +347,7 @@ async def test_image_pull_success() -> None:
     fake = _PullClient(b'{"status":"Pulling from library/nginx"}\n{"status":"Digest: ok"}\n')
     client_mod._client = fake  # type: ignore[assignment]
     body = json.loads(
-        _text(
-            await mcp.call_tool(
-                "portainer_image_pull", {"image_name": "nginx", "tag": "1.25"}
-            )
-        )
+        _text(await mcp.call_tool("portainer_image_pull", {"image_name": "nginx", "tag": "1.25"}))
     )
     assert body == {"status": "pulled", "image": "nginx:1.25"}
     assert fake.params == {"fromImage": "nginx", "tag": "1.25"}
@@ -380,11 +380,7 @@ async def test_containers_list_rejects_bad_filter() -> None:
     containers.register(mcp)
     client_mod._client = _ListClient()  # type: ignore[assignment]
     body = json.loads(
-        _text(
-            await mcp.call_tool(
-                "portainer_containers_list", {"name_filter": "web; rm -rf /"}
-            )
-        )
+        _text(await mcp.call_tool("portainer_containers_list", {"name_filter": "web; rm -rf /"}))
     )
     assert body["error"] == "Validation error"
     # The message must name the actual parameter, not "container_id".
@@ -509,9 +505,7 @@ class _MutatingClient:
     ("args", "expected"),
     [({}, "false"), ({"force": False}, "false"), ({"force": True}, "true")],
 )
-async def test_container_remove_force_propagation(
-    args: dict[str, Any], expected: str
-) -> None:
+async def test_container_remove_force_propagation(args: dict[str, Any], expected: str) -> None:
     mcp = FastMCP("t")
     containers.register(mcp)
     fake = _MutatingClient()
@@ -525,9 +519,7 @@ async def test_container_remove_force_propagation(
     ("args", "expected"),
     [({}, "false"), ({"force": True}, "true")],
 )
-async def test_volume_remove_force_propagation(
-    args: dict[str, Any], expected: str
-) -> None:
+async def test_volume_remove_force_propagation(args: dict[str, Any], expected: str) -> None:
     mcp = FastMCP("t")
     volumes.register(mcp)
     fake = _MutatingClient()
@@ -541,9 +533,7 @@ async def test_volume_remove_force_propagation(
     ("args", "expected"),
     [({}, False), ({"force": True}, True)],
 )
-async def test_network_disconnect_force_propagation(
-    args: dict[str, Any], expected: bool
-) -> None:
+async def test_network_disconnect_force_propagation(args: dict[str, Any], expected: bool) -> None:
     mcp = FastMCP("t")
     networks.register(mcp)
     fake = _MutatingClient()
@@ -647,3 +637,105 @@ async def test_stack_deploy_rejects_empty_compose() -> None:
     )
     assert body["error"] == "Validation error"
     assert "empty" in body["details"]
+
+
+# --- sensitive-field filtering (endpoints, users) ---------------------------------
+
+
+class _GetClient:
+    """Returns canned data for any GET path."""
+
+    def __init__(self, data: Any) -> None:
+        self._data = data
+
+    async def get(self, path: str, **kwargs: Any) -> Any:
+        return self._data
+
+
+_RAW_ENDPOINT: dict[str, Any] = {
+    "Id": 1,
+    "Name": "primary",
+    "Type": 1,
+    "URL": "unix:///var/run/docker.sock",
+    "Status": 1,
+    "GroupId": 1,
+    "TLSConfig": {"TLS": True, "TLSCACert": "fake-ca-material tls-leak-canary"},
+    "AzureCredentials": {"ApplicationID": "app", "AuthenticationKey": "azure-leak-canary"},
+    "Edge": {"AsyncMode": False},
+    "Agent": {"Version": "2.19"},
+    "Kubernetes": {"Configuration": {}},
+    "SecuritySettings": {"allowBindMountsForRegularUsers": True},
+}
+
+
+async def test_endpoint_inspect_strips_sensitive_fields() -> None:
+    mcp = FastMCP("t")
+    endpoints.register(mcp)
+    client_mod._client = _GetClient(_RAW_ENDPOINT)  # type: ignore[assignment]
+    raw = _text(await mcp.call_tool("portainer_endpoint_inspect", {"endpoint_id": 1}))
+    body = json.loads(raw)
+    assert body["Id"] == 1
+    assert body["Name"] == "primary"
+    assert set(body) <= endpoints._ENDPOINT_SAFE_FIELDS
+    for canary in ("tls-leak-canary", "azure-leak-canary"):
+        assert canary not in raw
+
+
+async def test_endpoints_list_returns_summary_only() -> None:
+    mcp = FastMCP("t")
+    endpoints.register(mcp)
+    client_mod._client = _GetClient([_RAW_ENDPOINT])  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool("portainer_endpoints_list", {})))
+    assert body == [
+        {
+            "id": 1,
+            "name": "primary",
+            "type": 1,
+            "url": "unix:///var/run/docker.sock",
+            "status": 1,
+            "group_id": 1,
+        }
+    ]
+
+
+_RAW_USER: dict[str, Any] = {
+    "Id": 3,
+    "Username": "ops",
+    "Role": 2,
+    "Password": "hash-leak-canary",
+    "TOTPSecret": "totp-leak-canary",
+    "TokenIssueAt": 1700000000,
+    "ThemeSettings": {"color": "dark"},
+}
+
+
+async def test_user_inspect_strips_credentials() -> None:
+    mcp = FastMCP("t")
+    users.register(mcp)
+    client_mod._client = _GetClient(_RAW_USER)  # type: ignore[assignment]
+    raw = _text(await mcp.call_tool("portainer_user_inspect", {"user_id": 3}))
+    body = json.loads(raw)
+    assert body["Username"] == "ops"
+    assert body["Role"] == 2
+    assert set(body) <= users._USER_SAFE_FIELDS
+    for canary in ("hash-leak-canary", "totp-leak-canary"):
+        assert canary not in raw
+
+
+async def test_users_list_returns_summary_only() -> None:
+    mcp = FastMCP("t")
+    users.register(mcp)
+    client_mod._client = _GetClient([_RAW_USER])  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool("portainer_users_list", {})))
+    assert body == [{"id": 3, "username": "ops", "role": 2}]
+
+
+# bool ids are not covered here: FastMCP's pydantic layer coerces True -> 1 before
+# validate_id runs; the bool rejection itself is covered in test_helpers.
+@pytest.mark.parametrize("bad_id", [0, -1])
+async def test_user_inspect_rejects_invalid_id(bad_id: int) -> None:
+    mcp = FastMCP("t")
+    users.register(mcp)
+    client_mod._client = _GetClient(_RAW_USER)  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool("portainer_user_inspect", {"user_id": bad_id})))
+    assert body["error"] == "Validation error"
