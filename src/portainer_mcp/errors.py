@@ -65,8 +65,13 @@ def redact_secrets(text: str) -> str:
     """Replace obvious secret material with a placeholder for safe logging."""
     if len(text) > _MAX_REDACT_CHARS:
         text = text[:_MAX_REDACT_CHARS] + "... (truncated)"
-    text = _URL_CREDS_RE.sub(f"://{REDACTED}@", text)
-    return _SECRET_RE.sub(REDACTED, text)
+    return _redact_shapes(text)
+
+
+def _redact_shapes(value: str) -> str:
+    """The generic pass: URL credentials, ``--password`` flags, ``k=v`` pairs."""
+    value = _URL_CREDS_RE.sub(f"://{REDACTED}@", value)
+    return _SECRET_RE.sub(REDACTED, value)
 
 
 # --- Environment-variable redaction (stack Env, service Env, compose text) ------
@@ -120,12 +125,15 @@ _BLOCK_SCALAR_RE = re.compile(r"^[|>][-+]?\d?$")
 # `- ` list item) and a value that is a flow collection opener / list of
 # identifiers / YAML anchor — never a quoted string. `SECRETS: ["sk-…"]`
 # under `environment:` therefore stays masked.
-_COMPOSE_REFERENCE_KEYS = frozenset({"secrets", "configs"})
+# (`configs` is not a sensitive name, so only `secrets` needs the exemption.)
+_COMPOSE_REFERENCE_KEYS = frozenset({"secrets"})
 _REFERENCE_VALUE_RE = re.compile(
-    r"^(?:"
-    r"\[[ A-Za-z0-9_.\-,]{0,4096}\]?"  # [a, b] or a multi-line opener "["
+    r"^(?:&[A-Za-z0-9_\-]{1,128}\s{1,16})?"  # optional leading anchor: `&s [..]`
+    r"(?:"
+    r"\[[ A-Za-z0-9_.\-,\"']{0,4096}\]?"  # [a, "b"] or a multi-line opener "["
     r"|\{\s{0,16}\}?"  # {} or a multi-line opener "{"
-    r")$"
+    r")"
+    r"(?:\s{1,16}#.{0,4096})?$"  # trailing comment
 )
 # A YAML anchor definition or alias (`&defaults`, `*defaults`) is structure,
 # not a value — masking it breaks every later `*alias`, whatever the key.
@@ -163,18 +171,15 @@ def _points_at_secret(name: str, value: str) -> bool:
     exactly what a model editing compose needs to see. The value must look
     like a path — a ``*_FILE`` name alone proves nothing (``API_KEY_FILE=ghp_…``)."""
     bare = value.strip().strip("\"'")
+    if not _PATH_VALUE_RE.match(bare):
+        return False  # "/run/secrets/db extra" is not a path either
     if bare.startswith(_SECRET_MOUNT_PREFIX):
         return True
     segments = _NAME_SPLIT_RE.split(name.lower())
-    if segments[-1] != "file" or not _PATH_VALUE_RE.match(bare):
+    if segments[-1] != "file":
         return False
     # Absolute paths need a directory: "/9jX4kQ…" is a token, "/etc/x" a file.
     return bare.startswith(".") or bare.count("/") >= 2
-
-
-def _redact_shapes(value: str) -> str:
-    value = _URL_CREDS_RE.sub(f"://{REDACTED}@", value)
-    return _SECRET_RE.sub(REDACTED, value)
 
 
 def redact_env_value(name: str, value: str) -> str:
@@ -255,13 +260,15 @@ def redact_compose_text(text: str) -> str:
             lines[idx] = line
             continue
         prefix, name, sep, value = m.group("prefix", "name", "sep", "value")
-        if _YAML_ANCHOR_RE.match(value.strip()):
+        mapping_form = "-" not in prefix and sep.strip().startswith(":")
+        if mapping_form and _YAML_ANCHOR_RE.match(value.strip()):
+            # `key: &anchor` / `key: *alias` — YAML structure, not a value.
+            # In `KEY=*Sup3r` or `- KEY=&x`, `*`/`&` are just characters.
             lines[idx] = line
             continue
         if (
             name in _COMPOSE_REFERENCE_KEYS
-            and "-" not in prefix
-            and sep.strip().startswith(":")
+            and mapping_form
             and _REFERENCE_VALUE_RE.match(value.strip())
         ):
             # `secrets: [a, b]` / `secrets: [` / `configs: {}` / `secrets: &x`

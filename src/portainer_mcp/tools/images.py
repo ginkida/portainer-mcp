@@ -43,13 +43,22 @@ def _validate_image_ref(ref: str) -> None:
         )
 
 
+# portainer.RegistryType
+_REGISTRY_TYPES = {
+    1: "quay",
+    2: "azure",
+    3: "custom",
+    4: "gitlab",
+    5: "proget",
+    6: "dockerhub",
+    7: "ecr",
+}
+_DOCKERHUB_REGISTRY_TYPE = next(k for k, v in _REGISTRY_TYPES.items() if v == "dockerhub")
 # Every spelling of Docker Hub collapses to the canonical host, so a private
 # Hub repository can match a DockerHub registry configured in Portainer
 # (Portainer stores those with URL "docker.io").
 _DOCKER_HUB = "docker.io"
 _DOCKER_HUB_HOSTS = frozenset({_DOCKER_HUB, "index.docker.io", "registry-1.docker.io"})
-# Portainer registry type for Docker Hub (portainer.RegistryType).
-_DOCKERHUB_REGISTRY_TYPE = 6
 # registry_id=0 is the explicit "anonymous, ignore any stored credentials"
 # switch — validate_id would otherwise reject 0 and there would be no way
 # to opt out of auto-matching (a rotated stored token breaks public pulls).
@@ -66,15 +75,27 @@ def image_registry_host(image: str) -> str:
     ``https://reg.local``.
     """
     first, sep, _ = image.partition("/")
-    if not sep or ("." not in first and ":" not in first and first != "localhost"):
+    # reference.splitDockerDomain: a component with an uppercase letter is a
+    # host too (repository paths must be lowercase), so `Registry/app`
+    # addresses host "registry", not the Hub namespace "Registry".
+    looks_like_host = (
+        "." in first or ":" in first or first == "localhost" or first != first.lower()
+    )
+    if not sep or not looks_like_host:
         return _DOCKER_HUB
-    host = first.lower()
-    if host in _DOCKER_HUB_HOSTS:
-        return _DOCKER_HUB
-    for default_port in (":443", ":80"):
-        if host.endswith(default_port):
-            return host[: -len(default_port)]
-    return host
+    host = _registry_host(first)
+    return _DOCKER_HUB if host in _DOCKER_HUB_HOSTS else host
+
+
+def _is_hub_official(image: str) -> bool:
+    """``nginx`` / ``library/nginx`` / ``docker.io/nginx`` — an official
+    image, always public: a stored Hub token adds nothing to the pull."""
+    if image_registry_host(image) != _DOCKER_HUB:
+        return False
+    first, sep, rest = image.partition("/")
+    path = rest if sep and first.lower() in _DOCKER_HUB_HOSTS else image
+    repo = path.split("@", 1)[0].rsplit(":", 1)[0]
+    return "/" not in repo or repo.startswith("library/")
 
 
 def _registry_host(url: Any) -> str:
@@ -117,15 +138,22 @@ async def match_registry_id(
     public image must keep working; the label carries the candidate ids.
     """
     host = image_registry_host(image)
+    if host == _DOCKER_HUB and _is_hub_official(image):
+        # Official images are public; a stored Hub token adds nothing and a
+        # stale one would break the pull.
+        return None, "none (official Docker Hub image)"
     try:
         registries = await client.get(f"/api/endpoints/{eid}/registries")
     except Exception as exc:
         logger.warning("Registry listing failed while matching %s: %s", image, exc)
         return None, "none (registry listing failed)"
+    if not isinstance(registries, list):
+        logger.warning("Unexpected registry listing body while matching %s", image)
+        return None, "none (unexpected registry listing)"
     matches: list[int] = []
-    for reg in registries or []:
-        if not isinstance(reg, dict):
-            continue
+    for reg in registries:
+        if not isinstance(reg, dict) or not reg.get("Authentication"):
+            continue  # an unauthenticated entry injects nothing
         rid = reg.get("Id")
         if not isinstance(rid, int) or isinstance(rid, bool) or rid <= 0:
             continue
@@ -313,8 +341,16 @@ def register(mcp: FastMCP) -> None:
             endpoint_id: Target endpoint ID (uses default if omitted)
         """
         # Validate the two parts separately: concatenated, a tag containing
-        # "/" re-parses as a registry host:port and slips through.
+        # "/" re-parses as a registry host:port and slips through. And the
+        # name must not carry its own tag/digest: Docker's `tag` query param
+        # would silently replace it and a different image would be pulled.
         _validate_image_ref(image_name)
+        last = image_name.rsplit("/", 1)[-1]
+        if ":" in last or "@" in image_name:
+            raise ValueError(
+                f"image_name {image_name!r} already carries a tag or digest; "
+                "pass the tag via the tag argument instead"
+            )
         if not _IMAGE_TAG_RE.match(tag):
             raise ValueError(f"Invalid tag: {tag!r}. Must match {_IMAGE_TAG_RE.pattern}")
         client = get_client()
@@ -408,11 +444,6 @@ def register(mcp: FastMCP) -> None:
             })
         return json.dumps(result, indent=2, ensure_ascii=False)
 
-
-# portainer.RegistryType
-_REGISTRY_TYPES = {
-    1: "quay", 2: "azure", 3: "custom", 4: "gitlab", 5: "proget", 6: "dockerhub", 7: "ecr",
-}
 
 
 # Re-exported for callers that want to assemble the X-Registry-Auth header

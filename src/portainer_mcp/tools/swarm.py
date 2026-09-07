@@ -60,6 +60,9 @@ _UPDATE_IN_PROGRESS_STATES = frozenset({"updating", "rollback_started"})
 _WAIT_POLL_SECONDS = 3.0
 _MIN_WAIT_SECONDS = 5
 _DEFAULT_WAIT_SECONDS = 120
+# Credential labels from images.match_registry_id that mean "we could not
+# decide", as opposed to "no credentials needed" (public / official image).
+_MATCH_FAILED_RE = re.compile(r"ambiguous|listing failed|unexpected registry")
 
 
 def _validate_service_id(service_id: str) -> None:
@@ -656,6 +659,11 @@ def register(mcp: FastMCP) -> None:
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         _, spec, version = await _load_service(client, eid, service_id)
+        if replicas is not None and "Replicated" not in (spec.get("Mode") or {}):
+            raise ValueError(
+                f"Service {service_id!r} is not replicated (mode: "
+                f"{_service_mode(spec)[0]}); replicas cannot be set"
+            )
         headers: dict[str, str] = {}
         credentials = "none"
         if image is not None or registry_id is not None:
@@ -665,6 +673,19 @@ def register(mcp: FastMCP) -> None:
             headers, registry_id, credentials = await registry_auth_headers(
                 client, eid, image or "", registry_id
             )
+            if image is not None and not headers and _MATCH_FAILED_RE.search(credentials):
+                # Unlike a pull, a service update rolls out cluster-wide: with
+                # no usable credentials every new task would die with "no
+                # basic auth credentials" and pause the rollout. Stop here.
+                raise ValueError(
+                    f"No registry credentials for {image!r}: {credentials}. Pass "
+                    f"registry_id explicitly, or registry_id={ANONYMOUS_REGISTRY} if the "
+                    "image is public."
+                )
+            if registry_id is None and credentials == "anonymous (forced)":
+                # Swarm keeps the spec's stored PullOptions when no header is
+                # sent, so "anonymous" would overpromise here.
+                credentials = "no new credentials (registry_id=0)"
 
         changes: dict[str, Any] = {}
         task_template = spec.setdefault("TaskTemplate", {})
@@ -674,11 +695,6 @@ def register(mcp: FastMCP) -> None:
             container_spec["Image"] = image
         if replicas is not None:
             mode = spec.get("Mode") or {}
-            if "Replicated" not in mode:
-                raise ValueError(
-                    f"Service {service_id!r} is not replicated (mode: "
-                    f"{_service_mode(spec)[0]}); replicas cannot be set"
-                )
             changes["replicas"] = {
                 "from": (mode.get("Replicated") or {}).get("Replicas"),
                 "to": replicas,

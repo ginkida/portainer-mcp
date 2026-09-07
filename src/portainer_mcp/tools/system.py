@@ -15,10 +15,12 @@ logger = logging.getLogger(__name__)
 def swarm_flags(info: Any) -> tuple[bool, bool]:
     """``(joined, manager)`` from a Docker ``/info`` payload.
 
-    The one Swarm-detection idiom for the whole tool set: ``joined`` is
+    The one place that reads ``/info``'s Swarm block: ``joined`` is
     ``Swarm.LocalNodeState == "active"`` (true on workers too), ``manager``
     additionally requires ``ControlAvailable`` — the only state in which the
-    service/task/node tools and the Swarm stack path actually work.
+    service/task/node tools and the Swarm stack path actually work. (The
+    Swarm *endpoints* themselves signal the same thing by failing —
+    ``stack_deploy``'s ``/docker/swarm`` probe, ``swarm.py``'s 503 check.)
     """
     swarm = (info or {}).get("Swarm") if isinstance(info, dict) else None
     swarm = swarm if isinstance(swarm, dict) else {}

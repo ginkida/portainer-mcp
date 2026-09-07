@@ -1014,7 +1014,7 @@ async def test_service_update_auto_matches_registry_for_private_image() -> None:
     assert json.loads(base64.b64decode(fake.update["headers"]["X-Registry-Auth"])) == {
         "registryId": 3
     }
-    # Docker Hub image with no Hub-type registry: lookup, no match, no header.
+    # Official Docker Hub image: public, no lookup, no header, rollout proceeds.
     fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
     body = json.loads(
         _text(
@@ -1023,7 +1023,8 @@ async def test_service_update_auto_matches_registry_for_private_image() -> None:
             )
         )
     )
-    assert body["registry_id"] is None and body["credentials"] == "none"
+    assert body["registry_id"] is None
+    assert body["credentials"] == "none (official Docker Hub image)"
     assert fake.update is not None and fake.update["headers"] == {}
     # Force-only: no image, no lookup at all.
     fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
@@ -1046,5 +1047,41 @@ async def test_service_update_auto_matches_registry_for_private_image() -> None:
             )
         )
     )
-    assert body["credentials"] == "anonymous (forced)"
+    assert body["credentials"] == "no new credentials (registry_id=0)"
     assert fake.update is not None and fake.update["headers"] == {}
+
+
+async def test_service_update_refuses_rollout_without_decided_credentials() -> None:
+    """A pull can fall back to anonymous; a cluster-wide rollout with no usable
+    credentials just pauses with 'no basic auth credentials'."""
+
+    class _TwoRegistries(_SwarmClient):
+        async def get(self, path: str, **kwargs: Any) -> Any:
+            if path.endswith("/registries"):
+                return [
+                    {"Id": 3, "URL": "reg.local", "Authentication": True},
+                    {"Id": 5, "URL": "https://reg.local", "Authentication": True},
+                ]
+            return await super().get(path, **kwargs)
+
+    fake = _TwoRegistries([_service("svc-a-id", "etl_backend")])
+    body = json.loads(
+        _text(
+            await _mcp(fake).call_tool(
+                "portainer_service_update", {"service_id": "svc-a-id", "image": "reg.local/app:v2"}
+            )
+        )
+    )
+    assert body["error"] == "Validation error"
+    assert "ambiguous" in body["details"] and "registry_id=0" in body["details"]
+    assert fake.update is None  # nothing rolled out
+    # An unknown private host with no registry at all is fine (plain "none").
+    fake2 = _SwarmClient([_service("svc-a-id", "etl_backend")])
+    body = json.loads(
+        _text(
+            await _mcp(fake2).call_tool(
+                "portainer_service_update", {"service_id": "svc-a-id", "image": "other.host/app:v2"}
+            )
+        )
+    )
+    assert body["status"] == "updated" and body["credentials"] == "none"

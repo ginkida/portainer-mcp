@@ -437,3 +437,29 @@ def test_compose_reference_exemption_is_structural() -> None:
         "  password: *anchors\n"
     )
     assert redact_compose_text(structural) == structural
+
+
+def test_anchor_exemption_is_mapping_form_only() -> None:
+    env = "environment:\n  - DB_PASSWORD=*Sup3r-secret\n  - API_TOKEN=&x9Kz_q2\n  PASS: &y\n"
+    out = redact_compose_text(env)
+    assert "Sup3r" not in out and "x9Kz" not in out
+    assert "  PASS: &y\n" in out  # mapping form: a YAML anchor, kept
+
+
+def test_mount_prefix_needs_path_shape() -> None:
+    assert redact_env_value("DB_PASSWORD", "/run/secrets/ hunter2 secret") == REDACTED
+    assert redact_env_value("DB_PASSWORD", "/run/secrets/db_pw") == "/run/secrets/db_pw"
+    assert "hunter2" not in redact_compose_text("  DB_PASSWORD: /run/secrets/db_pw hunter2\n")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "  secrets: [db_pass] # prod\n",
+        "  secrets: [\"db_pass\", 'api_key']\n",
+        "  secrets: &s [db_pass]\n",
+        "  secrets: [\n",
+    ],
+)
+def test_secrets_reference_spellings_are_kept(line: str) -> None:
+    assert redact_compose_text(line) == line

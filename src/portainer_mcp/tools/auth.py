@@ -56,34 +56,41 @@ def register(mcp: FastMCP) -> None:
         endpoints: Any = None
         default: dict[str, Any] = {
             "id": config.default_endpoint,
+            "found": None,  # true/false once the listing answered
             "name": None,
             "status": None,
             "swarm": None,
             "swarm_role": None,
         }
+        probe_timeout = min(_PROBE_TIMEOUT, config.timeout)
         try:
             # excludeSnapshots: the listing is only used for count/name/status,
             # not the multi-KB snapshot each endpoint carries.
             endpoints = await client.get(
-                "/api/endpoints", params={"excludeSnapshots": "true"}, timeout=_PROBE_TIMEOUT
+                "/api/endpoints", params={"excludeSnapshots": "true"}, timeout=probe_timeout
             )
         except _ENRICHMENT_ERRORS as exc:
             logger.debug("status: endpoint listing failed: %s", exc)
         if not isinstance(endpoints, list):
             endpoints = None  # a non-list 200 body is "unknown", not "zero endpoints"
         endpoint_list = [e for e in (endpoints or []) if isinstance(e, dict)]
+        if endpoints is not None:
+            # The most common setup error: PORTAINER_DEFAULT_ENDPOINT names an
+            # endpoint that does not exist. Say so instead of leaving nulls.
+            default["found"] = False
         for ep in endpoint_list:
             if ep.get("Id") == config.default_endpoint:
+                default["found"] = True
                 default["name"] = ep.get("Name")
                 default["status"] = ep.get("Status")  # 1 = up, 2 = down
                 break
-        if default["status"] != _ENDPOINT_DOWN:
+        if default["found"] is not False and default["status"] != _ENDPOINT_DOWN:
             # Skip the agent round-trip when Portainer already says the
-            # endpoint is down — it would only burn the full timeout.
+            # endpoint is missing or down — it would only burn the timeout.
             try:
                 info = await client.get(
                     f"/api/endpoints/{config.default_endpoint}/docker/info",
-                    timeout=_PROBE_TIMEOUT,
+                    timeout=probe_timeout,
                 )
             except _ENRICHMENT_ERRORS as exc:
                 logger.debug("status: docker info for default endpoint failed: %s", exc)

@@ -82,6 +82,7 @@ async def test_status_connected() -> None:
         "endpoints": 2,
         "default_endpoint": {
             "id": 1,
+            "found": True,
             "name": "primary",
             "status": 1,
             "swarm": True,
@@ -108,6 +109,7 @@ async def test_status_enrichment_failures_do_not_break_connectivity() -> None:
     assert body["endpoints"] is None
     assert body["default_endpoint"] == {
         "id": 1,
+        "found": None,
         "name": None,
         "status": None,
         "swarm": None,
@@ -204,13 +206,34 @@ async def test_status_reports_api_key_auth_and_standalone(monkeypatch: pytest.Mo
     mcp = FastMCP("t")
     auth.register(mcp)
     client_mod._client = _StatusClient(  # type: ignore[assignment]
-        data=_STATUS, endpoints=[], info={"Swarm": {"LocalNodeState": "inactive"}}
+        data=_STATUS, endpoints=[{"Id": 1}], info={"Swarm": {"LocalNodeState": "inactive"}}
     )
     body = json.loads(_text(await mcp.call_tool("portainer_status", {})))
     assert body["auth"] == "api_key"
-    assert body["endpoints"] == 0
+    assert body["endpoints"] == 1
     assert body["default_endpoint"]["swarm"] is False
     assert body["default_endpoint"]["swarm_role"] is None
+
+
+async def test_status_flags_missing_default_endpoint_and_skips_probe() -> None:
+    class _Client(_StatusClient):
+        def __init__(self) -> None:
+            super().__init__(data=_STATUS, endpoints=[{"Id": 3, "Name": "only"}])
+            self.paths: list[str] = []
+
+        async def get(self, path: str, **kwargs: Any) -> Any:
+            self.paths.append(path)
+            return await super().get(path, **kwargs)
+
+    mcp = FastMCP("t")
+    auth.register(mcp)
+    fake = _Client()
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool("portainer_status", {})))
+    assert body["endpoints"] == 1
+    assert body["default_endpoint"]["found"] is False
+    assert body["default_endpoint"]["swarm"] is None
+    assert not any(p.endswith("/docker/info") for p in fake.paths)
 
 
 async def test_status_unreachable_reports_disconnected_and_redacts() -> None:
@@ -509,7 +532,7 @@ async def test_image_pull_success() -> None:
         "status": "pulled",
         "image": "nginx:1.25",
         "registry_id": None,
-        "credentials": "none",
+        "credentials": "none (official Docker Hub image)",
     }
     assert fake.params == {"fromImage": "nginx", "tag": "1.25"}
 
@@ -1674,8 +1697,9 @@ class _RegistryPullClient(_PullHeaderClient):
 
 
 _REGISTRIES = [
-    {"Id": 7, "Name": "hub-mirror", "URL": "https://mirror.example.com/v2/", "Type": 3},
+    {"Id": 7, "URL": "https://mirror.example.com/v2/", "Type": 3, "Authentication": True},
     {"Id": 3, "Name": "gitlab", "URL": "reg.ginkida.dev", "Type": 4, "Authentication": True},
+    {"Id": 9, "URL": "reg.noauth.example", "Type": 3, "Authentication": False},
 ]
 
 
@@ -1705,17 +1729,69 @@ async def test_image_pull_docker_hub_matches_only_hub_type_registry() -> None:
     images.register(mcp)
     fake = _RegistryPullClient(_REGISTRIES)  # no DockerHub-type registry configured
     client_mod._client = fake  # type: ignore[assignment]
-    for name in ("nginx", "ginkida/app", "docker.io/library/nginx"):
-        body = json.loads(_text(await mcp.call_tool("portainer_image_pull", {"image_name": name})))
-        assert body["registry_id"] is None and body["credentials"] == "none", name
-        assert fake.headers == {}
-    # A DockerHub-type registry (Type 6, URL docker.io) does match a private Hub repo.
-    hub = _RegistryPullClient([*_REGISTRIES, {"Id": 11, "URL": "docker.io", "Type": 6}])
+    body = json.loads(_text(await mcp.call_tool("portainer_image_pull", {"image_name": "x/app"})))
+    assert body["registry_id"] is None and body["credentials"] == "none"
+    assert fake.headers == {}
+    # A DockerHub-type registry (Type 6, URL docker.io) matches a namespaced Hub repo…
+    hub = _RegistryPullClient(
+        [*_REGISTRIES, {"Id": 11, "URL": "docker.io", "Type": 6, "Authentication": True}]
+    )
     client_mod._client = hub  # type: ignore[assignment]
     body = json.loads(
         _text(await mcp.call_tool("portainer_image_pull", {"image_name": "ginkida/private"}))
     )
     assert body["registry_id"] == 11 and body["credentials"] == "portainer (auto)"
+    # …but never an official image: those are public and a stale token would break them.
+    for name in ("nginx", "library/nginx", "docker.io/library/nginx"):
+        body = json.loads(_text(await mcp.call_tool("portainer_image_pull", {"image_name": name})))
+        assert body["registry_id"] is None, name
+        assert body["credentials"] == "none (official Docker Hub image)", name
+        assert hub.headers == {}
+    assert hub.registry_calls == 1  # official images never list registries
+
+
+async def test_image_pull_skips_unauthenticated_and_odd_listings() -> None:
+    mcp = FastMCP("t")
+    images.register(mcp)
+    fake = _RegistryPullClient(_REGISTRIES)
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_image_pull", {"image_name": "reg.noauth.example/x"}))
+    )
+    assert body["registry_id"] is None and body["credentials"] == "none"
+    odd = _RegistryPullClient(True)  # a 200 whose JSON is a scalar
+    client_mod._client = odd  # type: ignore[assignment]
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_image_pull", {"image_name": "reg.ginkida.dev/x"}))
+    )
+    assert body["status"] == "pulled"
+    assert body["credentials"] == "none (unexpected registry listing)"
+
+
+@pytest.mark.parametrize(
+    ("image", "host"),
+    [
+        ("Registry/app", "registry"),  # uppercase first component = host (Docker rule)
+        ("reg.local:443/app", "reg.local"),
+        ("reg.local:80/app", "reg.local"),
+        ("reg.local:5000/app", "reg.local:5000"),
+    ],
+)
+def test_image_registry_host_edge_cases(image: str, host: str) -> None:
+    assert images.image_registry_host(image) == host
+
+
+@pytest.mark.parametrize("name", ["ghcr.io/org/app:v2", "nginx:1.25", "app@sha256:" + "a" * 64])
+async def test_image_pull_rejects_tag_inside_image_name(name: str) -> None:
+    """Docker's `tag` query param would silently replace the embedded tag."""
+    mcp = FastMCP("t")
+    images.register(mcp)
+    fake = _RegistryPullClient(_REGISTRIES)
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool("portainer_image_pull", {"image_name": name})))
+    assert body["error"] == "Validation error"
+    assert "already carries a tag" in body["details"]
+    assert fake.headers is None
 
 
 async def test_image_pull_ambiguous_registries_fall_back_to_anonymous() -> None:
@@ -1726,8 +1802,8 @@ async def test_image_pull_ambiguous_registries_fall_back_to_anonymous() -> None:
     images.register(mcp)
     two = _RegistryPullClient(
         [
-            {"Id": 3, "URL": "registry.gitlab.com", "Type": 4},
-            {"Id": 5, "URL": "https://registry.gitlab.com/", "Type": 4},
+            {"Id": 3, "URL": "registry.gitlab.com", "Type": 4, "Authentication": True},
+            {"Id": 5, "URL": "https://registry.gitlab.com/", "Type": 4, "Authentication": True},
         ]
     )
     client_mod._client = two  # type: ignore[assignment]
@@ -1763,10 +1839,12 @@ async def test_image_pull_ambiguous_registries_fall_back_to_anonymous() -> None:
 async def test_image_pull_failure_reports_credential_context() -> None:
     mcp = FastMCP("t")
     images.register(mcp)
-    fake = _RegistryPullClient([{"Id": 5, "URL": "docker.io", "Type": 6}])
+    fake = _RegistryPullClient([{"Id": 5, "URL": "docker.io", "Type": 6, "Authentication": True}])
     fake.payload = b'{"errorDetail":{"message":"unauthorized: incorrect username or password"}}\n'
     client_mod._client = fake  # type: ignore[assignment]
-    body = json.loads(_text(await mcp.call_tool("portainer_image_pull", {"image_name": "nginx"})))
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_image_pull", {"image_name": "ginkida/private"}))
+    )
     assert body["error"] == "Image pull failed"
     assert "unauthorized" in body["details"]
     assert "registry_id=5" in body["details"] and "credentials=portainer (auto)" in body["details"]
