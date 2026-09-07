@@ -346,3 +346,37 @@ async def test_handler_maps_non_json_response_error() -> None:
     body = json.loads(await _raising_tool(PortainerResponseError("html page token=SECRET"))())
     assert body["error"] == "Unexpected response from Portainer"
     assert "SECRET" not in body["details"] and "html page" in body["details"]
+
+
+def test_redact_compose_text_keeps_structural_secret_references() -> None:
+    text = (
+        "services:\n"
+        "  db:\n"
+        "    secrets: [db_password, api_key]\n"
+        "    configs:\n"
+        "      - source: app_config\n"
+        "        target: /etc/app.yml\n"
+        "    environment:\n"
+        "      DB_PASSWORD_FILE: /run/secrets/db_password\n"
+        "      - API_KEY=/run/secrets/api_key\n"
+        "      DB_PASSWORD: hunter2\n"
+        "secrets:\n"
+        "  db_password:\n"
+        "    external: true\n"
+        "    name: prod_db_password\n"
+        "  api_key:\n"
+        "    file: ./secrets/api_key.txt\n"
+    )
+    out = redact_compose_text(text)
+    expected = text.replace("DB_PASSWORD: hunter2", f"DB_PASSWORD: {REDACTED}")
+    assert out == expected
+
+
+def test_redact_env_value_keeps_secret_file_pointers() -> None:
+    assert redact_env_value("DB_PASSWORD_FILE", "/run/secrets/db") == "/run/secrets/db"
+    assert redact_env_value("DB_PASSWORD", "/run/secrets/db") == "/run/secrets/db"
+    assert redact_env_value("password-file", "/etc/pw.txt") == "/etc/pw.txt"
+    assert redact_env_value("DB_PASSWORD", "hunter2") == REDACTED
+    assert redact_env_pairs([{"name": "TOKEN_FILE", "value": "/run/secrets/t"}]) == [
+        {"name": "TOKEN_FILE", "value": "/run/secrets/t"}
+    ]

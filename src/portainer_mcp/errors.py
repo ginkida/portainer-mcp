@@ -112,6 +112,15 @@ _ENV_LINE_RE = re.compile(
 # YAML block scalar indicator (`KEY: |`, `KEY: >-`): the value lives on the
 # following, deeper-indented lines.
 _BLOCK_SCALAR_RE = re.compile(r"^[|>][-+]?\d?$")
+# Compose keys whose values are *names of* secrets/configs, not secrets:
+# `secrets: [db_pass]`, `configs:`, `- source: db_pass`, `external: true`.
+# They match the name heuristic ("secret") but masking them destroys the
+# document structure while hiding nothing.
+_COMPOSE_STRUCTURAL_KEYS = frozenset({
+    "secrets", "configs", "secret", "config", "source", "target", "external", "name", "file",
+})
+# Values that point at a secret rather than contain one.
+_SECRET_MOUNT_PREFIX = "/run/secrets/"
 
 
 def is_sensitive_env_name(name: str) -> bool:
@@ -129,10 +138,17 @@ def _is_reference(value: str) -> bool:
     return bool(_ENV_REFERENCE_RE.match(inner))
 
 
+def _points_at_secret(name: str, value: str) -> bool:
+    """``DB_PASSWORD_FILE=/run/secrets/db`` names *where* a secret is, and is
+    exactly what a model editing compose needs to see."""
+    segments = _NAME_SPLIT_RE.split(name.lower())
+    return segments[-1] == "file" or value.strip().strip("\"'").startswith(_SECRET_MOUNT_PREFIX)
+
+
 def redact_env_value(name: str, value: str) -> str:
     """Mask ``value`` when ``name`` looks sensitive; otherwise mask only
     embedded secret shapes (URL credentials, ``--password`` flags, ``k=v``)."""
-    if not value or _is_reference(value):
+    if not value or _is_reference(value) or _points_at_secret(name, value):
         return value
     if is_sensitive_env_name(name):
         return REDACTED
@@ -202,6 +218,11 @@ def redact_compose_text(text: str) -> str:
             lines[idx] = line
             continue
         prefix, name, sep, value = m.group("prefix", "name", "sep", "value")
+        if name.lower() in _COMPOSE_STRUCTURAL_KEYS:
+            # `secrets: [a, b]` / `source: db_pass` — references, keep as is
+            # (URL credentials were already masked above).
+            lines[idx] = line
+            continue
         if is_sensitive_env_name(name) and _BLOCK_SCALAR_RE.match(value.strip()):
             block_indent = _indent(line)
             lines[idx] = line
