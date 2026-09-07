@@ -218,7 +218,7 @@ All 53 tools are listed below with their parameters and descriptions (55 with th
 
 | Tool | Description |
 |---|---|
-| `portainer_status()` | Check connection and authentication status. Returns version and instance ID. |
+| `portainer_status()` | Check connection and authentication status. Returns version, instance ID, auth mode, the number of endpoints and whether the default endpoint is a Swarm cluster (manager). |
 
 ### Endpoints (Environments)
 

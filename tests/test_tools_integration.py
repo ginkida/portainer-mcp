@@ -37,21 +37,40 @@ def _text(result: Any) -> str:
 
 
 class _StatusClient:
-    def __init__(self, *, exc: Exception | None = None, data: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        *,
+        exc: Exception | None = None,
+        data: dict[str, Any] | None = None,
+        endpoints: Any = None,
+        info: Any = None,
+    ):
         self._exc = exc
         self._data = data
+        self._endpoints = endpoints
+        self._info = info
 
     async def get(self, path: str, **kwargs: Any) -> Any:
-        if self._exc is not None:
-            raise self._exc
-        return self._data
+        if path == "/api/status":
+            if self._exc is not None:
+                raise self._exc
+            return self._data
+        target = self._endpoints if path == "/api/endpoints" else self._info
+        if isinstance(target, Exception):
+            raise target
+        return target
+
+
+_STATUS = {"Version": "2.19.0", "InstanceID": "inst-1"}
 
 
 async def test_status_connected() -> None:
     mcp = FastMCP("t")
     auth.register(mcp)
     client_mod._client = _StatusClient(  # type: ignore[assignment]
-        data={"Version": "2.19.0", "InstanceID": "inst-1"}
+        data=_STATUS,
+        endpoints=[{"Id": 1, "Name": "primary", "Status": 1}, {"Id": 3, "Name": "edge"}],
+        info={"Swarm": {"LocalNodeState": "active", "ControlAvailable": True}},
     )
     body = json.loads(_text(await mcp.call_tool("portainer_status", {})))
     assert body == {
@@ -59,7 +78,51 @@ async def test_status_connected() -> None:
         "url": "https://portainer.test",
         "version": "2.19.0",
         "instance_id": "inst-1",
+        "auth": "password",
+        "endpoints": 2,
+        "default_endpoint": {
+            "id": 1,
+            "name": "primary",
+            "status": 1,
+            "swarm": True,
+            "swarm_manager": True,
+        },
     }
+
+
+async def test_status_enrichment_failures_do_not_break_connectivity() -> None:
+    """Endpoint listing / docker info are extras: a 403 or a dead endpoint
+    must not turn a reachable Portainer into connected=false."""
+    mcp = FastMCP("t")
+    auth.register(mcp)
+    req = httpx.Request("GET", "https://x")
+    client_mod._client = _StatusClient(  # type: ignore[assignment]
+        data=_STATUS,
+        endpoints=httpx.HTTPStatusError(
+            "denied", request=req, response=httpx.Response(403, request=req)
+        ),
+        info=httpx.ConnectError("agent down"),
+    )
+    body = json.loads(_text(await mcp.call_tool("portainer_status", {})))
+    assert body["connected"] is True
+    assert body["endpoints"] is None
+    assert body["default_endpoint"] == {"id": 1, "name": None, "swarm": None}
+
+
+async def test_status_reports_api_key_auth_and_standalone(monkeypatch: pytest.MonkeyPatch) -> None:
+    import portainer_mcp.config as config_mod
+
+    monkeypatch.setenv("PORTAINER_API_KEY", "ptr_x")
+    config_mod._config = None
+    mcp = FastMCP("t")
+    auth.register(mcp)
+    client_mod._client = _StatusClient(  # type: ignore[assignment]
+        data=_STATUS, endpoints=[], info={"Swarm": {"LocalNodeState": "inactive"}}
+    )
+    body = json.loads(_text(await mcp.call_tool("portainer_status", {})))
+    assert body["auth"] == "api_key"
+    assert body["endpoints"] == 0
+    assert body["default_endpoint"]["swarm"] is False
 
 
 async def test_status_unreachable_reports_disconnected_and_redacts() -> None:
