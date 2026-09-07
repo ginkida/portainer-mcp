@@ -11,6 +11,25 @@ _config: Config | None = None
 # Hosts for which plain http:// is tolerated (credentials never leave the box).
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
+# Truthy parse shared by every boolean knob: only these values enable it,
+# anything else (including typos) is false. Deliberately NOT a strict parse —
+# see the PORTAINER_VERIFY_SSL note in the project guide before changing it.
+_TRUTHY = ("true", "1", "yes")
+
+
+def _env_flag(name: str, default: str) -> bool:
+    return os.environ.get(name, default).lower() in _TRUTHY
+
+
+def laravel_tools_enabled() -> bool:
+    """Whether the opinionated Laravel helpers are registered as MCP tools.
+
+    Read directly from the environment (not via ``Config``) so ``server.py``
+    can decide the tool surface at import time without requiring the full
+    credential set to be present.
+    """
+    return _env_flag("PORTAINER_ENABLE_LARAVEL_TOOLS", "false")
+
 
 def _positive_float(name: str, default: str) -> float:
     raw = os.environ.get(name, default)
@@ -39,6 +58,9 @@ class Config:
         self.url = os.environ.get("PORTAINER_URL", "").rstrip("/")
         self.username = os.environ.get("PORTAINER_USERNAME", "")
         self.password = os.environ.get("PORTAINER_PASSWORD", "")
+        # Portainer access token (X-API-Key). When set it takes precedence over
+        # username/password: no JWT login, no CSRF dance, nothing to refresh.
+        self.api_key = os.environ.get("PORTAINER_API_KEY", "").strip()
 
         raw_endpoint = os.environ.get("PORTAINER_DEFAULT_ENDPOINT", "1")
         try:
@@ -53,11 +75,7 @@ class Config:
                 f"got {self.default_endpoint}"
             )
 
-        self.verify_ssl = os.environ.get("PORTAINER_VERIFY_SSL", "true").lower() in (
-            "true",
-            "1",
-            "yes",
-        )
+        self.verify_ssl = _env_flag("PORTAINER_VERIFY_SSL", "true")
 
         # Network tuning — all overridable via env, with safe defaults.
         # `timeout` covers ordinary metadata calls; `long_timeout` covers
@@ -75,16 +93,28 @@ class Config:
         missing: list[str] = []
         if not self.url:
             missing.append("PORTAINER_URL")
-        if not self.username:
-            missing.append("PORTAINER_USERNAME")
-        if not self.password:
-            missing.append("PORTAINER_PASSWORD")
+        if not self.api_key:
+            if not self.username:
+                missing.append("PORTAINER_USERNAME")
+            if not self.password:
+                missing.append("PORTAINER_PASSWORD")
         if missing:
+            hint = (
+                " (or set PORTAINER_API_KEY instead of username/password)"
+                if any(v != "PORTAINER_URL" for v in missing)
+                else ""
+            )
             raise ValueError(
-                f"Missing required environment variables: {', '.join(missing)}"
+                f"Missing required environment variables: {', '.join(missing)}{hint}"
             )
 
         self._validate_url()
+
+        if self.api_key and (self.username or self.password):
+            logger.warning(
+                "PORTAINER_API_KEY is set; PORTAINER_USERNAME/PORTAINER_PASSWORD "
+                "are ignored (API-key authentication takes precedence)."
+            )
 
         if not self.verify_ssl:
             logger.warning(

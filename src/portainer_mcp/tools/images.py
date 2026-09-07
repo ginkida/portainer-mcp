@@ -10,7 +10,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
 from ..config import get_config
-from ..errors import error_response, resolve_endpoint, tool_error_handler
+from ..errors import error_response, resolve_endpoint, tool_error_handler, validate_id
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,14 @@ def _validate_image_ref(ref: str) -> None:
             "Expected format: [registry/]name[:tag][@algo:digest], "
             "no path traversal (..)"
         )
+
+
+def portainer_registry_auth_header(registry_id: int) -> str:
+    """X-Registry-Auth value that makes Portainer inject a stored registry's
+    credentials. Portainer's Docker proxy decodes the header, looks the
+    registry up by ``registryId`` and replaces the header with the real
+    username/password before forwarding the request to the Docker daemon."""
+    return base64.b64encode(json.dumps({"registryId": registry_id}).encode()).decode("ascii")
 
 
 def _validate_registry_auth(auth: str) -> None:
@@ -131,30 +139,48 @@ def register(mcp: FastMCP) -> None:
     async def portainer_image_pull(
         image_name: str,
         tag: str = "latest",
+        registry_id: int | None = None,
         registry_auth: str | None = None,
         endpoint_id: int | None = None,
     ) -> str:
         """Pull a Docker image from a registry.
 
+        For a private registry configured in Portainer, pass its registry_id
+        (see portainer_registries_list): Portainer injects the stored
+        credentials itself, so no password ever passes through the model.
+        Explicit registry_auth is only needed for a registry Portainer does
+        not know about.
+
         Args:
             image_name: Image name (e.g. 'nginx', 'ghcr.io/org/app')
             tag: Image tag (default 'latest')
-            registry_auth: Optional base64-encoded JSON
+            registry_id: ID of a registry configured in Portainer whose
+                stored credentials should be used
+            registry_auth: Base64-encoded JSON
                 ({"username":..,"password":..,"serveraddress":..})
-                forwarded as X-Registry-Auth. Required for private registries.
+                forwarded as X-Registry-Auth for a registry not configured
+                in Portainer. Mutually exclusive with registry_id.
             endpoint_id: Target endpoint ID (uses default if omitted)
         """
         _validate_image_ref(f"{image_name}:{tag}")
+        if registry_id is not None and registry_auth is not None:
+            raise ValueError("Pass either registry_id or registry_auth, not both")
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
 
         headers: dict[str, str] = {}
-        if registry_auth is not None:
+        if registry_id is not None:
+            validate_id(registry_id, "registry_id")
+            headers["X-Registry-Auth"] = portainer_registry_auth_header(registry_id)
+        elif registry_auth is not None:
             _validate_registry_auth(registry_auth)
             headers["X-Registry-Auth"] = registry_auth
 
-        logger.info("AUDIT: Pulling image %s:%s on endpoint %d", image_name, tag, eid)
+        logger.info(
+            "AUDIT: Pulling image %s:%s on endpoint %d (registry_id=%s)",
+            image_name, tag, eid, registry_id,
+        )
         resp = await client.request(
             "POST",
             f"/api/endpoints/{eid}/docker/images/create",
@@ -210,6 +236,34 @@ def register(mcp: FastMCP) -> None:
         return json.dumps(
             {"status": "removed", "image_id": image_id}, indent=2, ensure_ascii=False
         )
+
+    @mcp.tool()
+    @tool_error_handler
+    async def portainer_registries_list() -> str:
+        """List registries configured in Portainer (id, name, URL, type).
+
+        Use the id as registry_id in portainer_image_pull /
+        portainer_service_update so Portainer supplies the stored credentials.
+        """
+        client = get_client()
+        registries = await client.get("/api/registries")
+        result = []
+        for r in registries or []:
+            result.append({
+                "id": r.get("Id"),
+                "name": r.get("Name"),
+                "url": r.get("URL"),
+                "type": r.get("Type"),
+                "type_name": _REGISTRY_TYPES.get(r.get("Type"), "unknown"),
+                "authentication": bool(r.get("Authentication")),
+            })
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+# portainer.RegistryType
+_REGISTRY_TYPES = {
+    1: "quay", 2: "azure", 3: "custom", 4: "gitlab", 5: "proget", 6: "dockerhub", 7: "ecr",
+}
 
 
 # Re-exported for callers that want to assemble the X-Registry-Auth header

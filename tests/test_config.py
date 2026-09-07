@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from portainer_mcp.config import Config
+from portainer_mcp.config import Config, laravel_tools_enabled
 
 
 def test_defaults() -> None:
@@ -99,3 +99,54 @@ def test_default_endpoint_must_be_int(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PORTAINER_DEFAULT_ENDPOINT", "notint")
     with pytest.raises(ValueError, match="integer"):
         Config()
+
+
+# --- API-key authentication ---------------------------------------------------------
+
+
+def test_api_key_replaces_username_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PORTAINER_USERNAME", "")
+    monkeypatch.setenv("PORTAINER_PASSWORD", "")
+    monkeypatch.setenv("PORTAINER_API_KEY", " ptr_abc ")
+    cfg = Config()
+    assert cfg.api_key == "ptr_abc"  # whitespace-stripped
+    assert cfg.username == "" and cfg.password == ""
+
+
+def test_missing_credentials_hint_mentions_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PORTAINER_USERNAME", "")
+    monkeypatch.setenv("PORTAINER_PASSWORD", "")
+    with pytest.raises(ValueError, match="PORTAINER_API_KEY"):
+        Config()
+
+
+def test_api_key_with_password_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("PORTAINER_API_KEY", "ptr_abc")
+    with caplog.at_level("WARNING"):
+        cfg = Config()
+    assert cfg.api_key == "ptr_abc"
+    assert any("takes precedence" in r.message for r in caplog.records)
+
+
+def test_api_key_still_requires_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PORTAINER_URL", "")
+    monkeypatch.setenv("PORTAINER_API_KEY", "ptr_abc")
+    with pytest.raises(ValueError, match="PORTAINER_URL"):
+        Config()
+
+
+# --- Laravel tools flag -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, False), ("true", True), ("1", True), ("YES", True), ("false", False), ("ture", False)],
+)
+def test_laravel_tools_flag(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
+) -> None:
+    if value is not None:
+        monkeypatch.setenv("PORTAINER_ENABLE_LARAVEL_TOOLS", value)
+    assert laravel_tools_enabled() is expected

@@ -354,3 +354,62 @@ async def test_close_client_closes_and_resets_singleton() -> None:
     assert client_mod._client is None
     # No-op when there is nothing to close.
     await close_client()
+
+
+# --- API-key mode -------------------------------------------------------------------
+
+
+def _api_key_client(handler: Handler, monkeypatch: pytest.MonkeyPatch) -> PortainerClient:
+    monkeypatch.setenv("PORTAINER_API_KEY", "ptr_key_1")
+    import portainer_mcp.config as config_mod
+
+    config_mod._config = None
+    return build_client(handler)
+
+
+async def test_api_key_mode_sends_only_x_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With an API key there is no /api/auth login, no Bearer token and no
+    Referer/CSRF header — Portainer skips the CSRF check for API-key requests
+    and rejects a request carrying both an API key and a Bearer token."""
+    seen: list[tuple[str, str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, dict(request.headers)))
+        return httpx.Response(200, json={"ok": True}, headers={"X-CSRF-Token": "C-IGNORED"})
+
+    client = _api_key_client(handler, monkeypatch)
+    try:
+        assert await client.get("/api/stacks") == {"ok": True}
+        assert await client.post("/api/stacks/1/start") == {"ok": True}
+    finally:
+        await client.close()
+
+    assert [(m, p) for m, p, _ in seen] == [("GET", "/api/stacks"), ("POST", "/api/stacks/1/start")]
+    for _, _, headers in seen:
+        assert headers["x-api-key"] == "ptr_key_1"
+        assert "authorization" not in headers
+        assert "referer" not in headers
+        assert "x-csrf-token" not in headers
+    assert client._jwt is None
+    assert client._auth_version == 0
+
+
+async def test_api_key_mode_does_not_retry_401(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"data": 0, "auth": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth":
+            calls["auth"] += 1
+            return httpx.Response(200, json={"jwt": "never"})
+        calls["data"] += 1
+        return httpx.Response(401, text="invalid api key")
+
+    client = _api_key_client(handler, monkeypatch)
+    try:
+        with pytest.raises(httpx.HTTPStatusError) as excinfo:
+            await client.post("/api/stacks/1/start")
+    finally:
+        await client.close()
+
+    assert excinfo.value.response.status_code == 401
+    assert calls == {"data": 1, "auth": 0}  # a static key can't be refreshed

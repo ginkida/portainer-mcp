@@ -11,6 +11,11 @@ _ENDPOINT_SAFE_FIELDS = {
     "Id", "Name", "Type", "URL", "Status", "GroupId", "PublicURL",
     "Snapshots", "EdgeID", "TagIds", "UserTrusted", "Extensions",
 }
+# Inside each snapshot, DockerSnapshotRaw is the full raw dump of every
+# container/image/volume/network at snapshot time — typically hundreds of KB
+# and often empty. The summary counters next to it are what an agent needs;
+# the list tools give the live objects.
+_SNAPSHOT_DROP_FIELDS = frozenset({"DockerSnapshotRaw", "SnapshotRaw"})
 
 
 def register(mcp: FastMCP) -> None:
@@ -44,4 +49,10 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         ep = await client.get(f"/api/endpoints/{endpoint_id}")
         filtered = {k: v for k, v in ep.items() if k in _ENDPOINT_SAFE_FIELDS}
+        if isinstance(filtered.get("Snapshots"), list):
+            filtered["Snapshots"] = [
+                {k: v for k, v in snap.items() if k not in _SNAPSHOT_DROP_FIELDS}
+                if isinstance(snap, dict) else snap
+                for snap in filtered["Snapshots"]
+            ]
         return json.dumps(filtered, indent=2, ensure_ascii=False)

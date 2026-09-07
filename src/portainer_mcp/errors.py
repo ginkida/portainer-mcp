@@ -48,12 +48,160 @@ _URL_CREDS_RE = re.compile(r"://[^/\s:@]*:[^/\s]+@")
 _MAX_REDACT_CHARS = 10_000
 
 
+REDACTED = "[REDACTED]"
+
+
 def redact_secrets(text: str) -> str:
     """Replace obvious secret material with a placeholder for safe logging."""
     if len(text) > _MAX_REDACT_CHARS:
         text = text[:_MAX_REDACT_CHARS] + "... (truncated)"
-    text = _URL_CREDS_RE.sub("://[REDACTED]@", text)
-    return _SECRET_RE.sub("[REDACTED]", text)
+    text = _URL_CREDS_RE.sub(f"://{REDACTED}@", text)
+    return _SECRET_RE.sub(REDACTED, text)
+
+
+# --- Environment-variable redaction (stack Env, service Env, compose text) ------
+#
+# Name-based: the *variable name* decides whether its value is masked, so a
+# value like "3" under CLICKHOUSE_PASSWORD is hidden while "9000" under
+# CLICKHOUSE_PORT is not. Recall-biased on purpose: a false positive costs one
+# masked value (reveal_env=true shows it), a miss leaks a credential to the
+# model's context.
+_SENSITIVE_NAME_SUBSTRINGS = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "credential",
+    "private",
+    "signature",
+    "salt",
+)
+# Whole segments (split on _ - .) — short words that would over-match as
+# substrings ("key" in "monkey", "pass" in "bypass", "auth" in "author").
+_SENSITIVE_NAME_SEGMENTS = frozenset({
+    "pwd", "pass", "key", "auth", "dsn", "cert", "hash", "jwt", "otp", "totp",
+})
+_NAME_SPLIT_RE = re.compile(r"[_\-.]")
+# A bare variable reference (`${DB_PASSWORD}` / `$DB_PASSWORD`) is not a
+# secret — it is the pointer the model needs to keep when editing compose.
+# Forms with a default (`${X:-hunter2}`) are still masked.
+_ENV_REFERENCE_RE = re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]{0,255}\}?$")
+# One `KEY=value` / `KEY: value` / `- KEY=value` compose/env line. The name
+# also allows `-` for YAML keys like `db-password`. Bounded quantifiers in the
+# prefix keep the per-line scan linear; the value runs to end of line so a
+# long secret (PEM, base64 cert) can't slip past a length cap unmasked.
+_ENV_LINE_RE = re.compile(
+    r"^(?P<prefix>\s{0,64}-?\s{0,64}[\"']?)"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_\-]{0,255})"
+    r"(?P<sep>[\"']?\s{0,16}[=:]\s{0,16})"
+    r"(?P<value>.+)$"
+)
+# YAML block scalar indicator (`KEY: |`, `KEY: >-`): the value lives on the
+# following, deeper-indented lines.
+_BLOCK_SCALAR_RE = re.compile(r"^[|>][-+]?\d?$")
+
+
+def is_sensitive_env_name(name: str) -> bool:
+    """Heuristic: does this environment-variable name look like a credential?"""
+    lowered = name.lower()
+    if any(sub in lowered for sub in _SENSITIVE_NAME_SUBSTRINGS):
+        return True
+    return any(seg in _SENSITIVE_NAME_SEGMENTS for seg in _NAME_SPLIT_RE.split(lowered))
+
+
+def _is_reference(value: str) -> bool:
+    inner = value.strip()
+    if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in "\"'":
+        inner = inner[1:-1]
+    return bool(_ENV_REFERENCE_RE.match(inner))
+
+
+def redact_env_value(name: str, value: str) -> str:
+    """Mask ``value`` when ``name`` looks sensitive; otherwise mask only
+    embedded secret shapes (URL credentials, ``--password`` flags, ``k=v``)."""
+    if not value or _is_reference(value):
+        return value
+    if is_sensitive_env_name(name):
+        return REDACTED
+    value = _URL_CREDS_RE.sub(f"://{REDACTED}@", value)
+    return _SECRET_RE.sub(REDACTED, value)
+
+
+def redact_env_pairs(pairs: list[Any]) -> list[Any]:
+    """Redact Portainer ``[{"name": .., "value": ..}]`` stack Env pairs."""
+    out: list[Any] = []
+    for pair in pairs:
+        if isinstance(pair, dict) and isinstance(pair.get("value"), str):
+            name = str(pair.get("name", ""))
+            out.append({**pair, "value": redact_env_value(name, pair["value"])})
+        else:
+            out.append(pair)
+    return out
+
+
+def redact_env_strings(items: list[Any]) -> list[Any]:
+    """Redact Docker-style ``["KEY=value", ...]`` environment lists."""
+    out: list[Any] = []
+    for item in items:
+        if isinstance(item, str) and "=" in item:
+            name, _, value = item.partition("=")
+            out.append(f"{name}={redact_env_value(name, value)}")
+        else:
+            out.append(item)
+    return out
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def redact_compose_text(text: str) -> str:
+    """Mask credential values in a compose/env file, line by line.
+
+    Handles ``KEY=value`` / ``KEY: value`` / ``- KEY=value`` lines (name-based),
+    YAML block scalars under a sensitive key (the indented continuation lines
+    are masked too), and — on every line — URL credentials, ``--password``
+    flags and ``k=v`` secret shapes via the same patterns as
+    :func:`redact_secrets`. Document structure survives intact. Output
+    containing ``[REDACTED]`` must never be sent back to Portainer —
+    ``stacks.py`` refuses it.
+    """
+    lines = text.split("\n")
+    block_indent: int | None = None  # masking a block scalar deeper than this
+    for idx, line in enumerate(lines):
+        if block_indent is not None:
+            if line.strip() and _indent(line) > block_indent:
+                lines[idx] = " " * _indent(line) + REDACTED
+                continue
+            if line.strip():
+                block_indent = None
+            else:
+                continue
+        # Generic shapes first (URL creds, --password, k=v): these may sit in
+        # `command:` / `entrypoint:` lines or bare list items.
+        line = _URL_CREDS_RE.sub(f"://{REDACTED}@", line)
+        m = _ENV_LINE_RE.match(line)
+        if m is None:
+            lines[idx] = _SECRET_RE.sub(REDACTED, line)
+            continue
+        prefix, name, sep, value = m.group("prefix", "name", "sep", "value")
+        if is_sensitive_env_name(name) and _BLOCK_SCALAR_RE.match(value.strip()):
+            block_indent = _indent(line)
+            lines[idx] = line
+            continue
+        masked = redact_env_value(name, value)
+        if masked != value:
+            # `- "KEY=value"`: the opening quote sits in the prefix, so keep
+            # the closing one out of the masked value to leave the line
+            # well-formed.
+            if masked == REDACTED and prefix and prefix[-1] in "\"'" and value.endswith(prefix[-1]):
+                masked += prefix[-1]
+            line = f"{prefix}{name}{sep}{masked}"
+        lines[idx] = line
+    return "\n".join(lines)
 
 
 # List-filter substrings go into a JSON query value (never a URL path), so a

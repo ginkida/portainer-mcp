@@ -6,7 +6,13 @@ import httpx
 import pytest
 
 from portainer_mcp.errors import (
+    REDACTED,
     error_response,
+    is_sensitive_env_name,
+    redact_compose_text,
+    redact_env_pairs,
+    redact_env_strings,
+    redact_env_value,
     redact_secrets,
     resolve_endpoint,
     tool_error_handler,
@@ -203,3 +209,117 @@ async def test_handler_unexpected_error_is_redacted() -> None:
     assert body["error"] == "Internal error"
     assert "SUPERSECRET" not in body["details"]
     assert "[REDACTED]" in body["details"]
+
+
+# --- environment-variable redaction ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CLICKHOUSE_PASSWORD", "DB_PASS", "APP_KEY", "API_KEY", "ApiKey", "JWT_SECRET",
+        "AUTH_TOKEN", "AWS_SECRET_ACCESS_KEY", "PRIVATE_KEY", "MAIL_PWD", "DATABASE_DSN",
+        "SIGNATURE", "REDIS_AUTH", "SESSION_SALT",
+    ],
+)
+def test_sensitive_env_names(name: str) -> None:
+    assert is_sensitive_env_name(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["CLICKHOUSE_PORT", "APP_ENV", "MONKEY_COUNT", "BYPASS_CACHE", "AUTHOR", "TAG", "KEYSPACE"],
+)
+def test_non_sensitive_env_names(name: str) -> None:
+    assert not is_sensitive_env_name(name)
+
+
+def test_redact_env_value_rules() -> None:
+    assert redact_env_value("DB_PASSWORD", "hunter2") == REDACTED
+    assert redact_env_value("DB_PASSWORD", "") == ""
+    # A bare variable reference is kept: the model needs it to edit compose.
+    assert redact_env_value("DB_PASSWORD", "${DB_PASSWORD}") == "${DB_PASSWORD}"
+    assert redact_env_value("DB_PASSWORD", "$DB_PASSWORD") == "$DB_PASSWORD"
+    # ...but a reference with a default may carry the secret itself.
+    assert redact_env_value("DB_PASSWORD", "${DB_PASSWORD:-hunter2}") == REDACTED
+    # Non-sensitive names pass through, except embedded URL credentials.
+    assert redact_env_value("DB_PORT", "5432") == "5432"
+    url = "postgres://user:" + "p4ss@db/app"
+    assert "p4ss" not in redact_env_value("DATABASE_URL", url)
+    assert redact_env_value("DATABASE_URL", url).endswith("@db/app")
+
+
+def test_redact_env_pairs_and_strings_keep_shape() -> None:
+    pairs = [{"name": "TOKEN", "value": "t"}, {"name": "PORT", "value": "80"}, "junk", {"x": 1}]
+    assert redact_env_pairs(pairs) == [
+        {"name": "TOKEN", "value": REDACTED}, {"name": "PORT", "value": "80"}, "junk", {"x": 1},
+    ]
+    assert redact_env_strings(["TOKEN=t", "PORT=80", "NOEQ", 5]) == [
+        f"TOKEN={REDACTED}", "PORT=80", "NOEQ", 5,
+    ]
+
+
+def test_redact_compose_text_preserves_structure() -> None:
+    text = (
+        "services:\n"
+        "  web:\n"
+        "    image: nginx:latest\n"
+        "    environment:\n"
+        "      - DB_PASSWORD=hunter2\n"
+        "      - DB_HOST=db\n"
+        '      APP_KEY: "base64:abc"\n'
+        "      REF: ${DB_PASSWORD}\n"
+        "    secrets:\n"
+        "      - db_password\n"
+        "  # password: comment-only line\n"
+    )
+    out = redact_compose_text(text)
+    assert out.count("\n") == text.count("\n")
+    assert "hunter2" not in out and "base64:abc" not in out
+    assert f"      - DB_PASSWORD={REDACTED}\n" in out
+    assert f"      APP_KEY: {REDACTED}\n" in out
+    assert "      - DB_HOST=db\n" in out
+    assert "    image: nginx:latest\n" in out
+    assert "      REF: ${DB_PASSWORD}\n" in out
+    assert "      - db_password\n" in out  # a list item without a value is untouched
+    # Even a comment gets the generic secret-shape pass (recall over precision).
+    assert "  # [REDACTED] line\n" in out
+
+
+def test_redact_compose_text_is_linear_on_long_lines() -> None:
+    import time
+
+    blob = "\n".join(["PASSWORD_" * 2000] * 50) + "\n" + ("x" * 200_000)
+    start = time.perf_counter()
+    redact_compose_text(blob)
+    assert time.perf_counter() - start < 0.5
+
+
+def test_redact_compose_text_keeps_quoted_list_items_balanced() -> None:
+    out = redact_compose_text('      - "DB_PASSWORD=x"\n      - \'TOKEN=y\'\n')
+    assert out == f'      - "DB_PASSWORD={REDACTED}"\n      - \'TOKEN={REDACTED}\'\n'
+
+
+@pytest.mark.parametrize(
+    ("text", "leak", "keep"),
+    [
+        ("TLS_KEY=" + "A" * 5000, "AAAA", None),  # no length cap on the value
+        ("  DB_PASSWORD: >\n    hunter2\n    tail\n  DB_HOST: db\n", "hunter2", "  DB_HOST: db"),
+        ("  PRIVATE_KEY: |\n    -----BEGIN\n    abc\n  next: 1\n", "BEGIN", "  next: 1"),
+        ("  command: mysql --password=hunter2 -h db", "hunter2", "-h db"),
+        ("  db-password: hunter2", "hunter2", "db-password:"),
+        ("    - " + "postgres://user:" + "pw@host/db", "pw@", "@host/db"),
+    ],
+)
+def test_redact_compose_text_extra_shapes(text: str, leak: str, keep: str | None) -> None:
+    out = redact_compose_text(text)
+    assert leak not in out
+    assert REDACTED in out
+    if keep:
+        assert keep in out
+    assert out.count("\n") == text.count("\n")
+
+
+def test_redact_compose_text_keeps_quoted_reference() -> None:
+    line = '  DB_PASSWORD: "${DB_PASSWORD}"\n'
+    assert redact_compose_text(line) == line

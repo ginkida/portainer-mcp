@@ -4,18 +4,19 @@ startCommand:
     type: object
     required:
       - portainerUrl
-      - portainerUsername
-      - portainerPassword
     properties:
       portainerUrl:
         type: string
         description: "Portainer base URL (e.g. https://portainer.example.com:9443)"
+      portainerApiKey:
+        type: string
+        description: "Portainer access token (X-API-Key). Preferred; when set, username/password are ignored"
       portainerUsername:
         type: string
-        description: "Portainer username"
+        description: "Portainer username (required unless portainerApiKey is set)"
       portainerPassword:
         type: string
-        description: "Portainer password"
+        description: "Portainer password (required unless portainerApiKey is set)"
       portainerDefaultEndpoint:
         type: string
         description: "Default endpoint ID"
@@ -24,15 +25,46 @@ startCommand:
         type: string
         description: "Set to false for self-signed certificates"
         default: "true"
+      portainerTimeout:
+        type: string
+        description: "Timeout in seconds for ordinary API calls"
+        default: "30"
+      portainerLongTimeout:
+        type: string
+        description: "Timeout in seconds for slow operations: image pull, exec, large log scans"
+        default: "300"
+      portainerHttpMaxConnections:
+        type: string
+        description: "Max concurrent HTTP connections to Portainer"
+        default: "100"
+      portainerHttpMaxKeepalive:
+        type: string
+        description: "Max idle keep-alive connections"
+        default: "20"
+      portainerJwtTtl:
+        type: string
+        description: "Proactive JWT refresh interval in seconds; keep below Portainer's session timeout (default 8h)"
+        default: "25200"
+      portainerEnableLaravelTools:
+        type: string
+        description: "Set to true to register the Laravel helper tools (laravel_errors, laravel_tinker)"
+        default: "false"
   commandFunction: |-
     (config) => ({
       command: 'python3',
       args: ['-m', 'portainer_mcp.server'],
       env: {
         PORTAINER_URL: config.portainerUrl,
-        PORTAINER_USERNAME: config.portainerUsername,
-        PORTAINER_PASSWORD: config.portainerPassword,
+        PORTAINER_API_KEY: config.portainerApiKey ?? '',
+        PORTAINER_USERNAME: config.portainerUsername ?? '',
+        PORTAINER_PASSWORD: config.portainerPassword ?? '',
         PORTAINER_DEFAULT_ENDPOINT: config.portainerDefaultEndpoint ?? '1',
-        PORTAINER_VERIFY_SSL: config.portainerVerifySsl ?? 'true'
+        PORTAINER_VERIFY_SSL: config.portainerVerifySsl ?? 'true',
+        PORTAINER_TIMEOUT: config.portainerTimeout ?? '30',
+        PORTAINER_LONG_TIMEOUT: config.portainerLongTimeout ?? '300',
+        PORTAINER_HTTP_MAX_CONNECTIONS: config.portainerHttpMaxConnections ?? '100',
+        PORTAINER_HTTP_MAX_KEEPALIVE: config.portainerHttpMaxKeepalive ?? '20',
+        PORTAINER_JWT_TTL: config.portainerJwtTtl ?? '25200',
+        PORTAINER_ENABLE_LARAVEL_TOOLS: config.portainerEnableLaravelTools ?? 'false'
       }
     })

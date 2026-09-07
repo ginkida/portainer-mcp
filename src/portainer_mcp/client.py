@@ -30,6 +30,11 @@ class PortainerClient:
         # Proactively refresh the JWT before Portainer's session lifetime
         # (default 8h) expires it server-side; see PORTAINER_JWT_TTL.
         self._jwt_ttl = config.jwt_ttl
+        # API-key mode: a static X-API-Key header replaces the whole JWT/CSRF
+        # state machine below (Portainer skips CSRF checks for API-key
+        # requests and rejects a request carrying both an API key and a
+        # Bearer token, so the two modes are mutually exclusive by design).
+        self._api_key: str | None = config.api_key or None
         self._jwt: str | None = None
         self._csrf_token: str | None = None
         self._jwt_obtained_at: float = 0
@@ -91,8 +96,8 @@ class PortainerClient:
         )
 
     async def _ensure_auth(self) -> None:
-        """Authenticate if JWT is missing or stale."""
-        if self._jwt_is_fresh():
+        """Authenticate if JWT is missing or stale (no-op in API-key mode)."""
+        if self._api_key is not None or self._jwt_is_fresh():
             return
         async with self._auth_lock:
             # Re-check inside the lock — another task may have refreshed.
@@ -135,6 +140,10 @@ class PortainerClient:
             )
 
     def _headers(self, method: str = "GET") -> dict[str, str]:
+        if self._api_key is not None:
+            # No Referer / CSRF token: Portainer's bouncer skips the CSRF
+            # check when the request authenticates with an API key.
+            return {"X-API-Key": self._api_key}
         h: dict[str, str] = {"Authorization": f"Bearer {self._jwt}"}
         # Referer + CSRF token only for mutating methods.
         # GET with Referer triggers CSRF validation in Portainer 2.39+.
@@ -165,7 +174,11 @@ class PortainerClient:
         merged_headers = {**user_headers, **self._headers(method)}
         resp = await self._http.request(method, path, headers=merged_headers, **kwargs)
         await self._capture_csrf(resp)
-        if resp.status_code == 401:
+        if self._api_key is not None:
+            # A static key can't be refreshed: a 401/403 is final, so skip the
+            # re-auth/retry branches entirely (and never re-send a mutation).
+            pass
+        elif resp.status_code == 401:
             logger.debug("Token expired, re-authenticating")
             await self._refresh_auth(attempted_version)
             attempted_version = self._auth_version

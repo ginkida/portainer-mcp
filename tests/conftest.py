@@ -26,6 +26,8 @@ def portainer_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "PORTAINER_DEFAULT_ENDPOINT",
         "PORTAINER_VERIFY_SSL",
         "PORTAINER_JWT_TTL",
+        "PORTAINER_API_KEY",
+        "PORTAINER_ENABLE_LARAVEL_TOOLS",
     ):
         monkeypatch.delenv(var, raising=False)
     config_mod._config = None

@@ -13,6 +13,7 @@ from portainer_mcp.tools import (
     containers,
     endpoints,
     images,
+    laravel,
     networks,
     stacks,
     users,
@@ -248,7 +249,7 @@ class _TinkerClient:
 )
 async def test_laravel_tinker_matches_backend_naming_schemes(name: str) -> None:
     mcp = FastMCP("t")
-    containers.register(mcp)
+    laravel.register(mcp)
     fake = _TinkerClient(["/other_backend.1.x", name])
     client_mod._client = fake  # type: ignore[assignment]
     body = json.loads(
@@ -268,7 +269,7 @@ async def test_laravel_tinker_matches_backend_naming_schemes(name: str) -> None:
 async def test_laravel_tinker_skips_sibling_services() -> None:
     """backend_worker / backend_horizon etc. must NOT be picked as 'backend'."""
     mcp = FastMCP("t")
-    containers.register(mcp)
+    laravel.register(mcp)
     fake = _TinkerClient(["/demo_backend_worker_1", "/demo_backend_horizon.1.x", "/demo_backend_1"])
     client_mod._client = fake  # type: ignore[assignment]
     body = json.loads(
@@ -285,7 +286,7 @@ async def test_laravel_tinker_skips_sibling_services() -> None:
 
 async def test_laravel_tinker_sibling_only_stack_reports_no_backend() -> None:
     mcp = FastMCP("t")
-    containers.register(mcp)
+    laravel.register(mcp)
     client_mod._client = _TinkerClient(  # type: ignore[assignment]
         ["/demo_backend_scheduler_1", "/demo_backend_worker.1.x"]
     )
@@ -302,7 +303,7 @@ async def test_laravel_tinker_sibling_only_stack_reports_no_backend() -> None:
 
 async def test_laravel_tinker_no_backend_found() -> None:
     mcp = FastMCP("t")
-    containers.register(mcp)
+    laravel.register(mcp)
     client_mod._client = _TinkerClient(["/demo_frontend.1.x"])  # type: ignore[assignment]
     body = json.loads(
         _text(
@@ -549,21 +550,41 @@ async def test_network_disconnect_force_propagation(args: dict[str, Any], expect
 # --- stack_update endpoint derivation ----------------------------------------------
 
 
+_STACK_ENV = [
+    {"name": "CLICKHOUSE_PASSWORD", "value": "ch-secret-canary"},
+    {"name": "API_KEY", "value": "api-key-canary"},
+    {"name": "TAG", "value": "v1"},
+]
+
+
 class _StackUpdateClient:
-    def __init__(self) -> None:
+    def __init__(self, *, prune: bool | None = False, env: list[Any] | None = None) -> None:
         self.put_params: dict[str, Any] | None = None
+        self.put_body: dict[str, Any] | None = None
+        self.file_fetched = False
+        self.env = list(_STACK_ENV) if env is None else env
+        self.prune = prune
 
     async def get(self, path: str, **kwargs: Any) -> Any:
         if path == "/api/stacks/9":
-            return {"Id": 9, "EndpointId": 5}
+            stack: dict[str, Any] = {"Id": 9, "EndpointId": 5, "Type": 1, "Env": self.env}
+            if self.prune is not None:
+                stack["Option"] = {"Prune": self.prune}
+            return stack
         if path == "/api/stacks/9/file":
+            self.file_fetched = True
             return {"StackFileContent": "services: {}"}
         raise AssertionError(path)
 
     async def put(self, path: str, **kwargs: Any) -> Any:
         assert path == "/api/stacks/9"
         self.put_params = kwargs.get("params")
+        self.put_body = kwargs.get("json")
         return None
+
+
+def _env_dict(body: dict[str, Any]) -> dict[str, str]:
+    return {p["name"]: p["value"] for p in body["Env"]}
 
 
 async def test_stack_update_derives_endpoint_from_stack() -> None:
@@ -574,8 +595,291 @@ async def test_stack_update_derives_endpoint_from_stack() -> None:
     fake = _StackUpdateClient()
     client_mod._client = fake  # type: ignore[assignment]
     body = json.loads(_text(await mcp.call_tool("portainer_stack_update", {"stack_id": 9})))
-    assert body == {"status": "updated", "stack_id": 9}
+    assert body["status"] == "updated"
+    assert body["stack_id"] == 9
+    assert body["endpoint_id"] == 5
     assert fake.put_params == {"endpointId": 5}
+    assert fake.file_fetched  # no compose_content -> stored file is redeployed
+
+
+async def test_stack_update_preserves_existing_env() -> None:
+    """Portainer replaces the whole Env list on PUT; a plain redeploy must
+    send the current variables back, not an empty list."""
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _StackUpdateClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    raw = _text(await mcp.call_tool("portainer_stack_update", {"stack_id": 9}))
+    assert fake.put_body is not None
+    assert _env_dict(fake.put_body) == {
+        "CLICKHOUSE_PASSWORD": "ch-secret-canary",
+        "API_KEY": "api-key-canary",
+        "TAG": "v1",
+    }
+    # The tool result reports names only — never the values.
+    assert "ch-secret-canary" not in raw
+    assert json.loads(raw)["env_names"] == ["API_KEY", "CLICKHOUSE_PASSWORD", "TAG"]
+
+
+async def test_stack_update_merges_and_removes_env() -> None:
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _StackUpdateClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    await mcp.call_tool(
+        "portainer_stack_update",
+        {"stack_id": 9, "env": {"TAG": "v2", "NEW": "x"}, "env_remove": ["API_KEY"]},
+    )
+    assert fake.put_body is not None
+    assert _env_dict(fake.put_body) == {
+        "CLICKHOUSE_PASSWORD": "ch-secret-canary",
+        "TAG": "v2",
+        "NEW": "x",
+    }
+
+
+@pytest.mark.parametrize(
+    ("stored_prune", "arg", "expected"),
+    [(True, None, True), (False, None, False), (None, None, False), (True, False, False)],
+)
+async def test_stack_update_prune_defaults_to_stack_setting(
+    stored_prune: bool | None, arg: bool | None, expected: bool
+) -> None:
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _StackUpdateClient(prune=stored_prune)
+    client_mod._client = fake  # type: ignore[assignment]
+    args: dict[str, Any] = {"stack_id": 9}
+    if arg is not None:
+        args["prune"] = arg
+    body = json.loads(_text(await mcp.call_tool("portainer_stack_update", args)))
+    assert fake.put_body is not None
+    assert fake.put_body["Prune"] is expected
+    assert body["prune"] is expected
+
+
+@pytest.mark.parametrize("pull", [False, True])
+async def test_stack_update_pull_image_sets_both_flags(pull: bool) -> None:
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _StackUpdateClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    await mcp.call_tool("portainer_stack_update", {"stack_id": 9, "pull_image": pull})
+    assert fake.put_body is not None
+    # RepullImageAndRedeploy is the 2.36+ field; PullImage the deprecated one.
+    assert fake.put_body["RepullImageAndRedeploy"] is pull
+    assert fake.put_body["PullImage"] is pull
+
+
+async def test_stack_update_uses_new_compose_without_fetching_file() -> None:
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _StackUpdateClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    await mcp.call_tool(
+        "portainer_stack_update", {"stack_id": 9, "compose_content": "services:\n  web: {}"}
+    )
+    assert fake.put_body is not None
+    assert fake.put_body["StackFileContent"] == "services:\n  web: {}"
+    assert not fake.file_fetched
+
+
+async def test_stack_update_rejects_redacted_compose_and_env() -> None:
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _StackUpdateClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(
+        _text(
+            await mcp.call_tool(
+                "portainer_stack_update",
+                {"stack_id": 9, "compose_content": "environment:\n  DB_PASSWORD=[REDACTED]\n"},
+            )
+        )
+    )
+    assert body["error"] == "Validation error"
+    assert "reveal_env=true" in body["details"]
+    body = json.loads(
+        _text(
+            await mcp.call_tool(
+                "portainer_stack_update", {"stack_id": 9, "env": {"X": "[REDACTED]"}}
+            )
+        )
+    )
+    assert body["error"] == "Validation error"
+    assert fake.put_body is None  # nothing reached Portainer
+
+
+@pytest.mark.parametrize("bad", ["1BAD", "with-dash", "", "a b"])
+async def test_stack_update_rejects_bad_env_name(bad: str) -> None:
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _StackUpdateClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_stack_update", {"stack_id": 9, "env": {bad: "v"}}))
+    )
+    assert body["error"] == "Validation error"
+    assert fake.put_body is None
+
+
+# --- stack inspect: env redaction -------------------------------------------------
+
+
+_COMPOSE_WITH_SECRETS = (
+    "services:\n"
+    "  db:\n"
+    "    image: clickhouse:latest\n"
+    "    environment:\n"
+    "      - CLICKHOUSE_PASSWORD=inline-canary\n"
+    "      - CLICKHOUSE_PORT=9000\n"
+    "      REF: ${CLICKHOUSE_PASSWORD}\n"
+)
+
+
+class _StackInspectClient:
+    async def get(self, path: str, **kwargs: Any) -> Any:
+        if path == "/api/stacks/9":
+            return {"Id": 9, "Name": "demo", "EndpointId": 5, "Env": list(_STACK_ENV)}
+        if path == "/api/stacks/9/file":
+            return {"StackFileContent": _COMPOSE_WITH_SECRETS}
+        raise AssertionError(path)
+
+
+async def test_stack_inspect_redacts_env_and_compose_by_default() -> None:
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    client_mod._client = _StackInspectClient()  # type: ignore[assignment]
+    raw = _text(await mcp.call_tool("portainer_stack_inspect", {"stack_id": 9}))
+    for canary in ("ch-secret-canary", "api-key-canary", "inline-canary"):
+        assert canary not in raw
+    body = json.loads(raw)
+    assert body["env_redacted"] is True
+    env = {p["name"]: p["value"] for p in body["Env"]}
+    assert env["TAG"] == "v1"  # non-secret values pass through
+    assert env["CLICKHOUSE_PASSWORD"] == "[REDACTED]"
+    compose = body["ComposeFileContent"]
+    assert "CLICKHOUSE_PORT=9000" in compose
+    assert "image: clickhouse:latest" in compose
+    assert "REF: ${CLICKHOUSE_PASSWORD}" in compose  # variable references survive
+    assert "CLICKHOUSE_PASSWORD=[REDACTED]" in compose
+
+
+async def test_stack_inspect_reveal_env_returns_everything() -> None:
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    client_mod._client = _StackInspectClient()  # type: ignore[assignment]
+    raw = _text(
+        await mcp.call_tool("portainer_stack_inspect", {"stack_id": 9, "reveal_env": True})
+    )
+    body = json.loads(raw)
+    assert body["env_redacted"] is False
+    assert body["ComposeFileContent"] == _COMPOSE_WITH_SECRETS
+    assert "ch-secret-canary" in raw
+
+
+# --- stack start/stop/delete: endpointId ------------------------------------------
+
+
+class _StackLifecycleClient:
+    def __init__(self, *, own_endpoint_exists: bool = True) -> None:
+        self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.own_endpoint_exists = own_endpoint_exists
+
+    async def get(self, path: str, **kwargs: Any) -> Any:
+        if path == "/api/stacks/9":
+            return {"Id": 9, "Name": "demo", "EndpointId": 5}
+        if path == "/api/endpoints/5":
+            if self.own_endpoint_exists:
+                return {"Id": 5}
+            req = httpx.Request("GET", "https://x")
+            raise httpx.HTTPStatusError(
+                "gone", request=req, response=httpx.Response(404, request=req)
+            )
+        raise AssertionError(path)
+
+    async def post(self, path: str, **kwargs: Any) -> Any:
+        self.calls.append(("POST", path, kwargs.get("params")))
+        return None
+
+    async def delete(self, path: str, **kwargs: Any) -> Any:
+        self.calls.append(("DELETE", path, kwargs.get("params")))
+        return None
+
+
+_LIFECYCLE = [
+    ("portainer_stack_start", "POST", "/api/stacks/9/start", "started"),
+    ("portainer_stack_stop", "POST", "/api/stacks/9/stop", "stopped"),
+    ("portainer_stack_delete", "DELETE", "/api/stacks/9", "deleted"),
+]
+
+
+@pytest.mark.parametrize(("tool", "method", "path", "status"), _LIFECYCLE)
+async def test_stack_lifecycle_sends_endpoint_id(
+    tool: str, method: str, path: str, status: str
+) -> None:
+    """Portainer 2.39 requires endpointId on start/stop (400 without) and
+    treats a delete without it as an orphaned stack on endpoint 0."""
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _StackLifecycleClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool(tool, {"stack_id": 9})))
+    assert body == {"status": status, "stack_id": 9, "endpoint_id": 5}
+    assert fake.calls == [(method, path, {"endpointId": 5})]
+    # The stack's own endpoint passed explicitly is fine too.
+    fake.calls.clear()
+    await mcp.call_tool(tool, {"stack_id": 9, "endpoint_id": 5})
+    assert fake.calls == [(method, path, {"endpointId": 5})]
+
+
+@pytest.mark.parametrize(("tool", "method", "path", "status"), _LIFECYCLE)
+async def test_stack_lifecycle_rejects_foreign_endpoint(
+    tool: str, method: str, path: str, status: str
+) -> None:
+    """A different endpoint_id would make Portainer act on the wrong endpoint
+    (and, for delete, drop the stack record while services keep running)."""
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _StackLifecycleClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool(tool, {"stack_id": 9, "endpoint_id": 1})))
+    assert body["error"] == "Validation error"
+    assert "belongs to endpoint 5" in body["details"]
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize(("tool", "method", "path", "status"), _LIFECYCLE)
+async def test_stack_lifecycle_allows_override_for_orphaned_stack(
+    tool: str, method: str, path: str, status: str
+) -> None:
+    """When the stack's endpoint no longer exists, the explicit endpoint is
+    the only way to act on it (admin orphan removal)."""
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _StackLifecycleClient(own_endpoint_exists=False)
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool(tool, {"stack_id": 9, "endpoint_id": 1})))
+    assert body == {"status": status, "stack_id": 9, "endpoint_id": 1}
+    assert fake.calls == [(method, path, {"endpointId": 1})]
+
+
+async def test_stack_update_rejects_foreign_endpoint() -> None:
+    class _Client(_StackUpdateClient):
+        async def get(self, path: str, **kwargs: Any) -> Any:
+            if path == "/api/endpoints/5":
+                return {"Id": 5}
+            return await super().get(path, **kwargs)
+
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _Client()
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_stack_update", {"stack_id": 9, "endpoint_id": 2}))
+    )
+    assert body["error"] == "Validation error"
+    assert fake.put_body is None
 
 
 # --- stack deploy: swarm vs standalone --------------------------------------------
@@ -621,6 +925,19 @@ async def test_stack_deploy_picks_correct_api_path(swarm: bool, deploy_type: str
     assert fake.post_path == f"/api/stacks/create/{deploy_type}/string"
     assert fake.post_body is not None
     assert ("SwarmID" in fake.post_body) is swarm
+
+
+async def test_stack_deploy_sends_env_pairs() -> None:
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _DeployClient(False)
+    client_mod._client = fake  # type: ignore[assignment]
+    await mcp.call_tool(
+        "portainer_stack_deploy",
+        {"name": "demo", "compose_content": "services: {}", "env": {"TAG": "v1", "X": "y"}},
+    )
+    assert fake.post_body is not None
+    assert fake.post_body["Env"] == [{"name": "TAG", "value": "v1"}, {"name": "X", "value": "y"}]
 
 
 async def test_stack_deploy_rejects_empty_compose() -> None:
@@ -739,3 +1056,266 @@ async def test_user_inspect_rejects_invalid_id(bad_id: int) -> None:
     client_mod._client = _GetClient(_RAW_USER)  # type: ignore[assignment]
     body = json.loads(_text(await mcp.call_tool("portainer_user_inspect", {"user_id": bad_id})))
     assert body["error"] == "Validation error"
+
+
+# --- containers_list: stack/service labels + stack_filter ------------------------
+
+
+_RAW_CONTAINERS: list[dict[str, Any]] = [
+    {
+        "Id": "aaaaaaaaaaaa0000",
+        "Names": ["/etl_backend.1.x"],
+        "Image": "app:latest",
+        "State": "running",
+        "Status": "Up",
+        "Created": 1,
+        "Labels": {
+            "com.docker.stack.namespace": "etl",
+            "com.docker.swarm.service.name": "etl_backend",
+        },
+    },
+    {
+        "Id": "bbbbbbbbbbbb0000",
+        "Names": ["/blog-web-1"],
+        "Image": "nginx",
+        "State": "running",
+        "Status": "Up",
+        "Created": 2,
+        "Labels": {
+            "com.docker.compose.project": "blog",
+            "com.docker.compose.service": "web",
+        },
+    },
+    {"Id": "cccccccccccc0000", "Names": ["/loose"], "Image": "x", "State": "exited"},
+]
+
+
+class _ContainersClient:
+    async def get(self, path: str, **kwargs: Any) -> Any:
+        return _RAW_CONTAINERS
+
+
+async def test_containers_list_reports_stack_and_service_labels() -> None:
+    mcp = FastMCP("t")
+    containers.register(mcp)
+    client_mod._client = _ContainersClient()  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool("portainer_containers_list", {})))
+    by_id = {c["id"]: c for c in body}
+    assert by_id["aaaaaaaaaaaa"]["stack"] == "etl"
+    assert by_id["aaaaaaaaaaaa"]["service"] == "etl_backend"
+    assert by_id["bbbbbbbbbbbb"]["stack"] == "blog"
+    assert by_id["bbbbbbbbbbbb"]["service"] == "web"
+    assert by_id["cccccccccccc"]["stack"] is None
+    assert by_id["cccccccccccc"]["service"] is None
+
+
+@pytest.mark.parametrize(
+    ("stack", "expected"),
+    [("etl", ["aaaaaaaaaaaa"]), ("blog", ["bbbbbbbbbbbb"]), ("nope", [])],
+)
+async def test_containers_list_stack_filter(stack: str, expected: list[str]) -> None:
+    mcp = FastMCP("t")
+    containers.register(mcp)
+    client_mod._client = _ContainersClient()  # type: ignore[assignment]
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_containers_list", {"stack_filter": stack}))
+    )
+    assert [c["id"] for c in body] == expected
+
+
+async def test_containers_list_rejects_bad_stack_filter() -> None:
+    mcp = FastMCP("t")
+    containers.register(mcp)
+    client_mod._client = _ContainersClient()  # type: ignore[assignment]
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_containers_list", {"stack_filter": "a.b"}))
+    )
+    assert body["error"] == "Validation error"
+
+
+# --- container_logs: since / timestamps -------------------------------------------
+
+
+class _LogParamsClient:
+    def __init__(self) -> None:
+        self.params: dict[str, Any] | None = None
+
+    async def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        self.params = kwargs.get("params")
+        return httpx.Response(200, content=b"x\n")
+
+
+async def test_container_logs_since_and_timestamps_forwarded() -> None:
+    mcp = FastMCP("t")
+    containers.register(mcp)
+    fake = _LogParamsClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    await mcp.call_tool(
+        "portainer_container_logs",
+        {"container_id": "abc", "since": "1700000000", "timestamps": True, "tail": 5},
+    )
+    assert fake.params == {
+        "stdout": "true", "stderr": "true", "tail": "5", "timestamps": "true",
+        "since": "1700000000",
+    }
+    # Defaults: no since / timestamps keys at all (Docker treats "" oddly).
+    await mcp.call_tool("portainer_container_logs", {"container_id": "abc"})
+    assert fake.params == {"stdout": "true", "stderr": "true", "tail": "100"}
+
+
+async def test_logs_grep_since_forwarded_and_bad_since_rejected() -> None:
+    mcp = FastMCP("t")
+    containers.register(mcp)
+    fake = _LogParamsClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    await mcp.call_tool(
+        "portainer_container_logs_grep", {"container_id": "abc", "pattern": "x", "since": "10m"}
+    )
+    assert fake.params is not None and "since" in fake.params
+    body = json.loads(
+        _text(
+            await mcp.call_tool(
+                "portainer_container_logs_grep",
+                {"container_id": "abc", "pattern": "x", "since": "yesterday"},
+            )
+        )
+    )
+    assert body["error"] == "Validation error"
+    assert "since" in body["details"]
+
+
+# --- image_pull: registry_id -> Portainer-managed credentials ----------------------
+
+
+async def test_image_pull_registry_id_builds_portainer_header() -> None:
+    mcp = FastMCP("t")
+    images.register(mcp)
+    fake = _PullHeaderClient(b'{"status":"ok"}\n')
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(
+        _text(
+            await mcp.call_tool(
+                "portainer_image_pull", {"image_name": "reg.local/app", "registry_id": 3}
+            )
+        )
+    )
+    assert body["status"] == "pulled"
+    assert fake.headers is not None
+    import base64
+
+    assert json.loads(base64.b64decode(fake.headers["X-Registry-Auth"])) == {"registryId": 3}
+
+
+async def test_image_pull_rejects_registry_id_with_registry_auth() -> None:
+    mcp = FastMCP("t")
+    images.register(mcp)
+    fake = _PullHeaderClient(b"")
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(
+        _text(
+            await mcp.call_tool(
+                "portainer_image_pull",
+                {"image_name": "app", "registry_id": 3, "registry_auth": "e30="},
+            )
+        )
+    )
+    assert body["error"] == "Validation error"
+    assert fake.headers is None
+
+
+class _PullHeaderClient(_PullClient):
+    def __init__(self, payload: bytes) -> None:
+        super().__init__(payload)
+        self.headers: dict[str, str] | None = None
+
+    async def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        self.headers = kwargs.get("headers")
+        return await super().request(method, path, **kwargs)
+
+
+async def test_registries_list_projects_safe_fields() -> None:
+    mcp = FastMCP("t")
+    images.register(mcp)
+    client_mod._client = _GetClient(  # type: ignore[assignment]
+        [
+            {
+                "Id": 3,
+                "Name": "gitlab",
+                "URL": "registry.example.com",
+                "Type": 4,
+                "Authentication": True,
+                "Username": "bot",
+                "Password": "registry-pass-canary",
+            }
+        ]
+    )
+    raw = _text(await mcp.call_tool("portainer_registries_list", {}))
+    assert "registry-pass-canary" not in raw
+    assert "bot" not in raw
+    assert json.loads(raw) == [
+        {
+            "id": 3,
+            "name": "gitlab",
+            "url": "registry.example.com",
+            "type": 4,
+            "type_name": "gitlab",
+            "authentication": True,
+        }
+    ]
+
+
+# --- endpoint_inspect: DockerSnapshotRaw is dropped -------------------------------
+
+
+async def test_endpoint_inspect_drops_raw_snapshot() -> None:
+    mcp = FastMCP("t")
+    endpoints.register(mcp)
+    raw_ep = {
+        **_RAW_ENDPOINT,
+        "Snapshots": [
+            {
+                "Time": 1,
+                "Swarm": True,
+                "RunningContainerCount": 4,
+                "DockerSnapshotRaw": {"Containers": ["raw-snapshot-canary"]},
+            }
+        ],
+    }
+    client_mod._client = _GetClient(raw_ep)  # type: ignore[assignment]
+    raw = _text(await mcp.call_tool("portainer_endpoint_inspect", {"endpoint_id": 1}))
+    assert "raw-snapshot-canary" not in raw
+    body = json.loads(raw)
+    assert body["Snapshots"] == [{"Time": 1, "Swarm": True, "RunningContainerCount": 4}]
+
+
+# --- since parsing ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("since", "expected"),
+    [
+        ("1700000000", 1700000000),
+        ("2026-09-07T10:00:00Z", 1788775200),
+        ("2026-09-07T10:00:00.123456789Z", 1788775200),  # Docker's RFC3339Nano
+        ("2026-09-07T10:00:00.5+02:00", 1788768000),
+        ("2026-09-07T10:00:00", 1788775200),  # naive -> UTC
+    ],
+)
+def test_parse_since_formats(since: str, expected: int) -> None:
+    assert containers._parse_since(since) == expected
+
+
+def test_parse_since_relative_and_empty() -> None:
+    import time
+
+    now = int(time.time())
+    assert containers._parse_since(None) is None
+    assert containers._parse_since("  ") is None
+    got = containers._parse_since("10m")
+    assert got is not None and now - 600 - 2 <= got <= now - 600
+
+
+@pytest.mark.parametrize("bad", ["20260907", "1", "x" * 65, "yesterday", "10x"])
+def test_parse_since_rejects(bad: str) -> None:
+    with pytest.raises(ValueError, match="since"):
+        containers._parse_since(bad)

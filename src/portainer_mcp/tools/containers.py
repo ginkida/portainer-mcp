@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import re
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -32,6 +34,19 @@ _MAX_STACK_TARGETS = 500
 _MAX_GREP_PATTERN_CHARS = 512
 _GREP_SCAN_TIMEOUT = 5.0
 
+# Docker labels that tie a container to its stack / service (Swarm and Compose).
+_STACK_LABELS = ("com.docker.stack.namespace", "com.docker.compose.project")
+_SERVICE_LABELS = ("com.docker.swarm.service.name", "com.docker.compose.service")
+
+# `since` for log tools: relative durations like "10m" / "2h" / "1d".
+_RELATIVE_SINCE_RE = re.compile(r"^(\d{1,9})([smhd])$")
+_SINCE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+# Unix seconds: 9-10 digits (2001..2286). Shorter all-digit strings are far
+# more likely a compact date typed by mistake than an epoch in 1970.
+_EPOCH_SINCE_RE = re.compile(r"^\d{9,10}$")
+# Fractional seconds in an ISO timestamp (`.123456789`), trimmed to 6 digits.
+_ISO_FRACTION_RE = re.compile(r"(\.\d{1,9})(?=[+\-Z]|$)")
+
 _ERROR_LINE_RE = re.compile(
     r"(?:"
     r'" [45]\d{2} '
@@ -54,6 +69,64 @@ def _validate_container_id(container_id: str) -> None:
             f"Invalid container_id: {container_id!r}. "
             "Must be alphanumeric with _ . - only"
         )
+
+
+def _parse_since(since: str | None) -> int | None:
+    """Turn a user-facing ``since`` into the Unix timestamp Docker expects.
+
+    Accepts a relative duration (``10m``, ``2h``, ``1d``), a Unix timestamp
+    (seconds) or an ISO-8601 / RFC 3339 datetime (``2026-09-07T10:00:00Z``,
+    nanosecond fractions as printed by ``timestamps=true`` included; a naive
+    value is taken as UTC). Returns ``None`` when ``since`` is empty.
+    """
+    if since is None or not since.strip():
+        return None
+    value = since.strip()
+    if len(value) > 64:
+        raise ValueError("Invalid since: too long")
+    m = _RELATIVE_SINCE_RE.match(value)
+    if m:
+        return int(time.time()) - int(m.group(1)) * _SINCE_UNITS[m.group(2)]
+    if _EPOCH_SINCE_RE.match(value):
+        return int(value)
+    if value.isdigit():
+        raise ValueError(
+            f"Invalid since: {value!r}. A Unix timestamp must be 9-10 digits "
+            "(seconds); use ISO-8601 for a date."
+        )
+    # Python 3.10's fromisoformat accepts neither a trailing "Z" nor more
+    # than 6 fractional digits (Docker prints 9) — normalise both.
+    iso = value[:-1] + "+00:00" if value.endswith("Z") else value
+    iso = _ISO_FRACTION_RE.sub(lambda f: f.group(1)[:7], iso)
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        raise ValueError(
+            f"Invalid since: {value!r}. Use a duration (10m, 2h, 1d), "
+            "a Unix timestamp or an ISO-8601 datetime."
+        ) from None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+def _log_params(tail: int, since: str | None, timestamps: bool) -> dict[str, str]:
+    """Query parameters shared by every Docker logs endpoint we call."""
+    params = {"stdout": "true", "stderr": "true", "tail": str(tail)}
+    if timestamps:
+        params["timestamps"] = "true"
+    since_ts = _parse_since(since)
+    if since_ts is not None:
+        params["since"] = str(since_ts)
+    return params
+
+
+def _container_labels(c: dict[str, Any]) -> tuple[str | None, str | None]:
+    """``(stack, service)`` from Swarm / Compose labels, or ``None``s."""
+    labels = c.get("Labels") or {}
+    stack = next((labels[k] for k in _STACK_LABELS if labels.get(k)), None)
+    service = next((labels[k] for k in _SERVICE_LABELS if labels.get(k)), None)
+    return stack, service
 
 
 def _parse_docker_stream(raw: bytes) -> str:
@@ -157,14 +230,20 @@ def register(mcp: FastMCP) -> None:
         endpoint_id: int | None = None,
         show_all: bool = False,
         name_filter: str | None = None,
+        stack_filter: str | None = None,
     ) -> str:
-        """List containers on an endpoint.
+        """List containers on an endpoint, with their stack and service.
+
+        On a Swarm endpoint prefer portainer_services_list / stack_status —
+        containers there are task instances that come and go.
 
         Args:
             endpoint_id: Target endpoint ID (uses default if omitted)
             show_all: If true, show all containers including stopped ones
             name_filter: Only return containers whose name contains this
                 substring (server-side Docker filter)
+            stack_filter: Only return containers belonging to this stack
+                (Swarm namespace or Compose project label, exact match)
         """
         client = get_client()
         config = get_config()
@@ -173,12 +252,19 @@ def register(mcp: FastMCP) -> None:
         if name_filter is not None:
             validate_filter(name_filter, "name_filter")
             params["filters"] = json.dumps({"name": [name_filter]})
+        if stack_filter is not None and not _STACK_NAME_RE.match(stack_filter):
+            raise ValueError(f"Invalid stack_filter: {stack_filter!r}")
         containers = await client.get(
             f"/api/endpoints/{eid}/docker/containers/json",
             params=params,
         )
         result = []
         for c in containers:
+            # Swarm and Compose use different label keys, so the stack match
+            # is done client-side (Docker's label filter can't express OR).
+            stack, service = _container_labels(c)
+            if stack_filter is not None and stack != stack_filter:
+                continue
             result.append({
                 "id": c["Id"][:12],
                 "names": c.get("Names", []),
@@ -186,6 +272,8 @@ def register(mcp: FastMCP) -> None:
                 "state": c.get("State"),
                 "status": c.get("Status"),
                 "created": c.get("Created"),
+                "stack": stack,
+                "service": service,
             })
         return json.dumps(result, indent=2, ensure_ascii=False)
 
@@ -321,6 +409,8 @@ def register(mcp: FastMCP) -> None:
     async def portainer_container_logs(
         container_id: str,
         tail: int = 100,
+        since: str | None = None,
+        timestamps: bool = False,
         endpoint_id: int | None = None,
     ) -> str:
         """Get container logs.
@@ -328,17 +418,21 @@ def register(mcp: FastMCP) -> None:
         Args:
             container_id: Container ID or name
             tail: Number of lines from the end of the logs (default 100, max 1000)
+            since: Only lines newer than this: a duration ("10m", "2h", "1d"),
+                a Unix timestamp or an ISO-8601 datetime
+            timestamps: Prefix every line with its timestamp (default false)
             endpoint_id: Target endpoint ID (uses default if omitted)
         """
         _validate_container_id(container_id)
         tail = max(1, min(tail, 1000))
+        params = _log_params(tail, since, timestamps)
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         resp = await client.request(
             "GET",
             f"/api/endpoints/{eid}/docker/containers/{container_id}/logs",
-            params={"stdout": "true", "stderr": "true", "tail": str(tail)},
+            params=params,
             timeout=config.long_timeout,
         )
         output = _parse_docker_stream(resp.content)
@@ -350,6 +444,7 @@ def register(mcp: FastMCP) -> None:
             {
                 "container_id": container_id,
                 "tail": tail,
+                "since": since,
                 "truncated": truncated,
                 "total_chars": total_chars,
                 "logs": output,
@@ -365,6 +460,8 @@ def register(mcp: FastMCP) -> None:
         pattern: str,
         tail: int = 500,
         context_lines: int = 0,
+        since: str | None = None,
+        timestamps: bool = False,
         endpoint_id: int | None = None,
     ) -> str:
         """Search container logs for lines matching a regex pattern.
@@ -378,11 +475,15 @@ def register(mcp: FastMCP) -> None:
             pattern: Regex pattern to search for (case-insensitive)
             tail: Number of log lines to fetch before filtering (default 500, max 1000)
             context_lines: Lines of context around each match (default 0, max 5)
+            since: Only scan lines newer than this: a duration ("10m", "2h",
+                "1d"), a Unix timestamp or an ISO-8601 datetime
+            timestamps: Prefix every line with its timestamp (default false)
             endpoint_id: Target endpoint ID (uses default if omitted)
         """
         _validate_container_id(container_id)
         tail = max(1, min(tail, 1000))
         context_lines = max(0, min(context_lines, 5))
+        params = _log_params(tail, since, timestamps)
         if len(pattern) > _MAX_GREP_PATTERN_CHARS:
             raise ValueError(
                 f"Regex pattern too long (max {_MAX_GREP_PATTERN_CHARS} chars)"
@@ -398,7 +499,7 @@ def register(mcp: FastMCP) -> None:
         resp = await client.request(
             "GET",
             f"/api/endpoints/{eid}/docker/containers/{container_id}/logs",
-            params={"stdout": "true", "stderr": "true", "tail": str(tail)},
+            params=params,
             timeout=config.long_timeout,
         )
         text = _parse_docker_stream(resp.content)
@@ -549,226 +650,6 @@ def register(mcp: FastMCP) -> None:
                 "total_errors": total_errors,
                 "truncated": truncated,
                 "containers": container_results,
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    @mcp.tool()
-    @tool_error_handler
-    async def portainer_laravel_errors(
-        stack_name: str,
-        tail: int = 50,
-        endpoint_id: int | None = None,
-    ) -> str:
-        """Get Laravel application-level errors from storage/logs/laravel.log.
-
-        Executes inside each running backend/horizon container of a stack
-        to read the actual Laravel error log (not nginx access log).
-        Returns production.ERROR entries with exception messages and context.
-
-        Use this AFTER portainer_stack_logs_errors to get root cause details
-        behind HTTP 500 errors seen in nginx access logs.
-
-        Args:
-            stack_name: Stack name prefix (e.g. "taylor", "blog", "somnlyx")
-            tail: Number of error lines to return per container (default 50, max 200)
-            endpoint_id: Target endpoint ID (uses default if omitted)
-        """
-        if not _STACK_NAME_RE.match(stack_name):
-            raise ValueError(f"Invalid stack_name: {stack_name!r}")
-        tail = max(1, min(tail, 200))
-
-        client = get_client()
-        config = get_config()
-        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
-
-        containers = await client.get(
-            f"/api/endpoints/{eid}/docker/containers/json",
-            params={"all": "false"},
-        )
-        targets = _stack_targets(containers, stack_name)
-
-        if not targets:
-            return json.dumps({
-                "stack": stack_name,
-                "containers_scanned": 0,
-                "message": f"No running containers found for stack '{stack_name}'",
-            }, indent=2, ensure_ascii=False)
-
-        if len(targets) > _MAX_STACK_TARGETS:
-            logger.warning(
-                "Stack %r has %d containers; scanning only the first %d",
-                stack_name, len(targets), _MAX_STACK_TARGETS,
-            )
-            targets = targets[:_MAX_STACK_TARGETS]
-
-        log_path = "/var/www/app/storage/logs/laravel.log"
-        # The exec command is a fixed read-only grep, but it still runs inside
-        # the containers — record the operation and its scope.
-        logger.info(
-            "AUDIT: laravel_errors grep exec for stack %r on endpoint %d (%d containers)",
-            stack_name, eid, len(targets),
-        )
-
-        # Bound concurrency: each target costs two API calls plus an in-container
-        # shell, so an unbounded fan-out over a big stack could overwhelm the host.
-        sem = asyncio.Semaphore(_STACK_FANOUT_LIMIT)
-
-        async def _fetch_laravel_errors(
-            cid: str, name: str,
-        ) -> tuple[str, str, str]:
-            safe_tail = int(tail)
-            # grep -E (ERE) is portable; \. matches a literal dot so we don't
-            # also catch e.g. "productionXERROR".
-            cmd = (
-                f'grep -E "production\\.(ERROR|CRITICAL|EMERGENCY)" '
-                f"{log_path} 2>/dev/null | tail -{safe_tail}"
-            )
-            exec_body = {
-                "AttachStdout": True,
-                "AttachStderr": True,
-                "Cmd": ["sh", "-c", cmd],
-            }
-            async with sem:
-                try:
-                    exec_resp = await client.post(
-                        f"/api/endpoints/{eid}/docker/containers/{cid}/exec",
-                        json=exec_body,
-                    )
-                    exec_id = exec_resp["Id"]
-                    start_resp = await client.request(
-                        "POST",
-                        f"/api/endpoints/{eid}/docker/exec/{exec_id}/start",
-                        json={"Detach": False, "Tty": False},
-                        timeout=config.long_timeout,
-                    )
-                    output = _parse_docker_stream(start_resp.content)
-                except Exception:
-                    # Keep details out of the tool output; log them server-side.
-                    logger.exception("laravel_errors exec failed for %s", name)
-                    output = "exec failed"
-            return name, cid, output
-
-        results = await asyncio.gather(
-            *[_fetch_laravel_errors(cid, name) for cid, name in targets],
-        )
-
-        container_results = {}
-        # Same pre-serialization output budget as stack_logs_errors.
-        remaining = _MAX_LOG_CHARS
-        truncated = False
-        for name, cid, output in results:
-            lines = [ln for ln in output.splitlines() if ln.strip()]
-            kept, dropped = _cap_lines(lines, remaining)
-            remaining -= sum(len(ln) + 1 for ln in kept)
-            truncated = truncated or dropped
-            container_results[name] = {
-                "container_id": cid,
-                "errors_found": len(lines),
-                "errors": kept,
-            }
-
-        return json.dumps(
-            {
-                "stack": stack_name,
-                "containers_scanned": len(targets),
-                "log_path": log_path,
-                "truncated": truncated,
-                "containers": container_results,
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    @mcp.tool()
-    @tool_error_handler
-    async def portainer_laravel_tinker(
-        stack_name: str,
-        code: str,
-        endpoint_id: int | None = None,
-    ) -> str:
-        """Execute PHP code via Laravel Tinker inside a stack's backend container.
-
-        Finds a running backend container for the given stack and runs
-        `php artisan tinker --execute="<code>"`. Useful for inspecting
-        database records, checking model state, running one-off fixes,
-        and debugging application issues.
-
-        Args:
-            stack_name: Stack name prefix (e.g. "taylor", "blog", "somnlyx")
-            code: PHP code to execute (will be passed to tinker --execute)
-            endpoint_id: Target endpoint ID (uses default if omitted)
-        """
-        if not _STACK_NAME_RE.match(stack_name):
-            raise ValueError(f"Invalid stack_name: {stack_name!r}")
-        if len(code) > 4096:
-            raise ValueError("Code too long (max 4096 chars)")
-
-        client = get_client()
-        config = get_config()
-        eid = resolve_endpoint(endpoint_id, config.default_endpoint)
-
-        containers = await client.get(
-            f"/api/endpoints/{eid}/docker/containers/json",
-            params={"all": "false"},
-        )
-
-        # Find the first running backend container for the stack (matches
-        # Swarm, plain-Compose and Compose-v1 naming — see _stack_targets).
-        backends = _stack_targets(containers, stack_name, service="backend")
-        if not backends:
-            return json.dumps({
-                "error": f"No running backend container found for stack '{stack_name}'",
-            }, indent=2, ensure_ascii=False)
-        target_id, target_name = backends[0]
-
-        # Redact the full code before truncating the preview, so a secret
-        # split across the cut can never land in the log half-masked.
-        logger.info(
-            "AUDIT: Laravel tinker in %s (%s) on endpoint %d: %s",
-            target_name, target_id, eid, redact_secrets(code)[:500],
-        )
-
-        # Escape single quotes in code for safe shell embedding
-        safe_code = code.replace("'", "'\\''")
-        exec_body = {
-            "AttachStdout": True,
-            "AttachStderr": True,
-            "Cmd": [
-                "sh", "-c",
-                f"cd /var/www/app && php artisan tinker --execute='{safe_code}'",
-            ],
-        }
-        exec_resp = await client.post(
-            f"/api/endpoints/{eid}/docker/containers/{target_id}/exec",
-            json=exec_body,
-        )
-        exec_id = exec_resp["Id"]
-
-        start_resp = await client.request(
-            "POST",
-            f"/api/endpoints/{eid}/docker/exec/{exec_id}/start",
-            json={"Detach": False, "Tty": False},
-            timeout=config.long_timeout,
-        )
-        output = _parse_docker_stream(start_resp.content)
-
-        inspect = await client.get(
-            f"/api/endpoints/{eid}/docker/exec/{exec_id}/json",
-        )
-        # `or {}`: never lose the exec output over a flaky metadata read.
-        exit_code = (inspect or {}).get("ExitCode", -1)
-
-        if len(output) > _MAX_LOG_CHARS:
-            output = output[:_MAX_LOG_CHARS] + "\n... truncated"
-
-        return json.dumps(
-            {
-                "container": target_name,
-                "container_id": target_id,
-                "exit_code": exit_code,
-                "output": output,
             },
             indent=2,
             ensure_ascii=False,
