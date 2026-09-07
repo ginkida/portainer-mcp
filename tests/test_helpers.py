@@ -456,10 +456,35 @@ def test_mount_prefix_needs_path_shape() -> None:
     "line",
     [
         "  secrets: [db_pass] # prod\n",
-        "  secrets: [\"db_pass\", 'api_key']\n",
         "  secrets: &s [db_pass]\n",
         "  secrets: [\n",
+        "  secrets: # shared\n",
+        "  secrets:   \n",
+        "  secrets: {db_password: {file: ./db.txt}}\n",
+        "  - secrets: [db_pass]\n",
     ],
 )
 def test_secrets_reference_spellings_are_kept(line: str) -> None:
     assert redact_compose_text(line) == line
+
+
+def test_quoted_values_under_secrets_key_are_masked() -> None:
+    """Quoted strings are values, not secret names — a lowercase `secrets`
+    key under `environment:` holding an API-key list must not slip through."""
+    out = redact_compose_text("environment:\n  secrets: [\"sk-live-abc123\", 'x']\n")
+    assert "sk-live" not in out and REDACTED in out
+
+
+def test_block_scalar_with_anchor_or_comment_is_masked() -> None:
+    for head in ("  PRIVATE_KEY: &pk |", "  PRIVATE_KEY: |  # pem", "  PRIVATE_KEY: >-"):
+        text = f"{head}\n    -----BEGIN RSA-----\n    AAAAsecret\n  next: 1\n"
+        out = redact_compose_text(text)
+        assert "AAAAsecret" not in out and "BEGIN" not in out, head
+        assert out.endswith("  next: 1\n")
+
+
+def test_file_pointer_needs_known_root_or_extension() -> None:
+    assert redact_env_value("DB_PASSWORD_FILE", "/7Hs9kLm2/qRt5vW8x") == REDACTED
+    assert redact_env_value("DB_PASSWORD_FILE", "/etc/app/key") == "/etc/app/key"
+    assert redact_env_value("DB_PASSWORD_FILE", "/data/x/key.pem") == "/data/x/key.pem"
+    assert redact_env_value("DB_PASSWORD_FILE", "/weird/dir/key.pem") == "/weird/dir/key.pem"

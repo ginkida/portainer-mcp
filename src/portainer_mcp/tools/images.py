@@ -62,7 +62,24 @@ _DOCKER_HUB_HOSTS = frozenset({_DOCKER_HUB, "index.docker.io", "registry-1.docke
 # registry_id=0 is the explicit "anonymous, ignore any stored credentials"
 # switch — validate_id would otherwise reject 0 and there would be no way
 # to opt out of auto-matching (a rotated stored token breaks public pulls).
+# It is sent as an explicit empty AuthConfig rather than no header: Docker's
+# service update would otherwise fall back to the credentials stored in the
+# service spec (`registryAuthFrom=spec`). Portainer's proxy passes a header
+# without `registryId` through untouched (only a literal `{}` is dropped).
 ANONYMOUS_REGISTRY = 0
+_EMPTY_AUTH_HEADER = base64.b64encode(
+    json.dumps({"username": "", "password": "", "serveraddress": ""}).encode()
+).decode("ascii")
+# Credential labels (`credentials` in tool results). swarm.py branches on
+# CRED_AMBIGUOUS — keep the constants, not the wording, as the contract.
+CRED_NONE = "none"
+CRED_AMBIGUOUS = "none (ambiguous"  # prefix; completed with the candidate ids
+CRED_LISTING_FAILED = "none (registry listing failed)"
+CRED_LISTING_ODD = "none (unexpected registry listing)"
+CRED_EXPLICIT_ID = "portainer"
+CRED_AUTO = "portainer (auto)"
+CRED_RAW = "explicit"
+CRED_ANONYMOUS = "anonymous (forced)"
 
 
 def image_registry_host(image: str) -> str:
@@ -87,17 +104,6 @@ def image_registry_host(image: str) -> str:
     return _DOCKER_HUB if host in _DOCKER_HUB_HOSTS else host
 
 
-def _is_hub_official(image: str) -> bool:
-    """``nginx`` / ``library/nginx`` / ``docker.io/nginx`` — an official
-    image, always public: a stored Hub token adds nothing to the pull."""
-    if image_registry_host(image) != _DOCKER_HUB:
-        return False
-    first, sep, rest = image.partition("/")
-    path = rest if sep and first.lower() in _DOCKER_HUB_HOSTS else image
-    repo = path.split("@", 1)[0].rsplit(":", 1)[0]
-    return "/" not in repo or repo.startswith("library/")
-
-
 def _registry_host(url: Any) -> str:
     """Normalise Portainer's Registry.URL to ``host[:port]``.
 
@@ -108,12 +114,14 @@ def _registry_host(url: Any) -> str:
     if not isinstance(url, str) or not url.strip():
         return ""
     raw = url.strip()
-    parts = urlsplit(raw if "://" in raw else f"//{raw}")
-    host = (parts.hostname or "").lower()
     try:
+        parts = urlsplit(raw if "://" in raw else f"//{raw}")
         port = parts.port
     except ValueError:
-        port = None
+        # urlsplit itself rejects e.g. an unbalanced IPv6 bracket; a broken
+        # registry entry must not break every pull.
+        return ""
+    host = (parts.hostname or "").lower()
     if not host:
         return ""
     if port is None or port in (80, 443):
@@ -138,18 +146,14 @@ async def match_registry_id(
     public image must keep working; the label carries the candidate ids.
     """
     host = image_registry_host(image)
-    if host == _DOCKER_HUB and _is_hub_official(image):
-        # Official images are public; a stored Hub token adds nothing and a
-        # stale one would break the pull.
-        return None, "none (official Docker Hub image)"
     try:
         registries = await client.get(f"/api/endpoints/{eid}/registries")
     except Exception as exc:
         logger.warning("Registry listing failed while matching %s: %s", image, exc)
-        return None, "none (registry listing failed)"
+        return None, CRED_LISTING_FAILED
     if not isinstance(registries, list):
         logger.warning("Unexpected registry listing body while matching %s", image)
-        return None, "none (unexpected registry listing)"
+        return None, CRED_LISTING_ODD
     matches: list[int] = []
     for reg in registries:
         if not isinstance(reg, dict) or not reg.get("Authentication"):
@@ -165,10 +169,10 @@ async def match_registry_id(
         elif reg_host == host:
             matches.append(rid)
     if not matches:
-        return None, "none"
+        return None, CRED_NONE
     if len(matches) > 1:
-        return None, f"none (ambiguous: registries {matches} match {host!r}; pass registry_id)"
-    return matches[0], "portainer (auto)"
+        return None, f"{CRED_AMBIGUOUS}: registries {matches} match {host!r}; pass registry_id)"
+    return matches[0], CRED_AUTO
 
 
 async def registry_auth_headers(
@@ -181,21 +185,21 @@ async def registry_auth_headers(
     """The one credential-selection path for pulls and service updates.
 
     Returns ``(headers, registry_id, credentials)`` where ``credentials``
-    says how they were chosen: ``portainer`` (explicit id), ``portainer
-    (auto)`` (matched by host), ``explicit`` (raw X-Registry-Auth),
-    ``anonymous (forced)`` (``registry_id=0``) or ``none``.
+    says how they were chosen (the ``CRED_*`` constants): explicit id,
+    matched by host, raw X-Registry-Auth, forced anonymous (``registry_id=0``
+    → an explicit empty AuthConfig) or none.
     """
     if registry_id is not None and registry_auth is not None:
         raise ValueError("Pass either registry_id or registry_auth, not both")
     if registry_id == ANONYMOUS_REGISTRY:
-        return {}, None, "anonymous (forced)"
+        return {"X-Registry-Auth": _EMPTY_AUTH_HEADER}, None, CRED_ANONYMOUS
     if registry_id is not None:
         validate_id(registry_id, "registry_id")
         headers = {"X-Registry-Auth": portainer_registry_auth_header(registry_id)}
-        return headers, registry_id, "portainer"
+        return headers, registry_id, CRED_EXPLICIT_ID
     if registry_auth is not None:
         _validate_registry_auth(registry_auth)
-        return {"X-Registry-Auth": registry_auth}, None, "explicit"
+        return {"X-Registry-Auth": registry_auth}, None, CRED_RAW
     matched, credentials = await match_registry_id(client, eid, image)
     if matched is None:
         return {}, None, credentials

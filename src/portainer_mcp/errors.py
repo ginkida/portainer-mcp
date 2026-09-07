@@ -116,7 +116,10 @@ _ENV_LINE_RE = re.compile(
 )
 # YAML block scalar indicator (`KEY: |`, `KEY: >-`): the value lives on the
 # following, deeper-indented lines.
-_BLOCK_SCALAR_RE = re.compile(r"^[|>][-+]?\d?$")
+# The indicator may carry a leading anchor (`&pk |`) and a trailing comment.
+_BLOCK_SCALAR_RE = re.compile(
+    r"^(?:&[A-Za-z0-9_\-]{1,128}\s{1,16})?[|>][-+]?\d?(?:\s{1,16}#.{0,4096})?$"
+)
 # Compose short-syntax secret/config references: `secrets: [db_pass, api_key]`.
 # The key matches the name heuristic ("secret") but the value is a list of
 # secret *names*; masking it wrecks the file while hiding nothing. The
@@ -127,13 +130,16 @@ _BLOCK_SCALAR_RE = re.compile(r"^[|>][-+]?\d?$")
 # under `environment:` therefore stays masked.
 # (`configs` is not a sensitive name, so only `secrets` needs the exemption.)
 _COMPOSE_REFERENCE_KEYS = frozenset({"secrets"})
+# Accepted shapes after `secrets:` — nothing (block form follows), a comment,
+# an anchor, a flow list / mapping of *unquoted* names (quotes would mean
+# string values, which are never secret names), or a multi-line opener.
 _REFERENCE_VALUE_RE = re.compile(
-    r"^(?:&[A-Za-z0-9_\-]{1,128}\s{1,16})?"  # optional leading anchor: `&s [..]`
+    r"^(?:&[A-Za-z0-9_\-]{1,128}(?:\s{1,16}|$))?"  # optional leading anchor
     r"(?:"
-    r"\[[ A-Za-z0-9_.\-,\"']{0,4096}\]?"  # [a, "b"] or a multi-line opener "["
-    r"|\{\s{0,16}\}?"  # {} or a multi-line opener "{"
-    r")"
-    r"(?:\s{1,16}#.{0,4096})?$"  # trailing comment
+    r"\[[ A-Za-z0-9_.\-,]{0,4096}\]?"  # [a, b] or a multi-line opener "["
+    r"|\{[ A-Za-z0-9_.\-,:{}/]{0,4096}\}?"  # {name: {file: ./x}} or opener "{"
+    r")?"
+    r"(?:\s{0,16}#.{0,4096})?$"  # trailing comment
 )
 # A YAML anchor definition or alias (`&defaults`, `*defaults`) is structure,
 # not a value — masking it breaks every later `*alias`, whatever the key.
@@ -148,6 +154,13 @@ _YAML_ANCHOR_RE = re.compile(r"^[&*][A-Za-z0-9_\-]{1,128}$")
 _SECRET_MOUNT_PREFIX = "/run/secrets/"
 _PATH_VALUE_RE = re.compile(
     r"^(?:\.{1,2}/|/)(?:[A-Za-z0-9_.\-]{1,64}/){0,32}[A-Za-z0-9_.\-]{0,64}$"
+)
+# An absolute `*_FILE` path must live under a directory a mounted or baked-in
+# file plausibly lives in, or name a file with an extension — "/7Hs9kLm2/qRt5"
+# (an unpadded token that happens to contain two slashes) is neither.
+_KNOWN_FILE_ROOTS = (
+    "/run/", "/etc/", "/var/", "/opt/", "/srv/", "/home/", "/root/", "/app/",
+    "/config/", "/secrets/", "/certs/", "/data/", "/mnt/", "/tmp/", "/usr/", "/shared/",
 )
 
 
@@ -178,8 +191,10 @@ def _points_at_secret(name: str, value: str) -> bool:
     segments = _NAME_SPLIT_RE.split(name.lower())
     if segments[-1] != "file":
         return False
-    # Absolute paths need a directory: "/9jX4kQ…" is a token, "/etc/x" a file.
-    return bare.startswith(".") or bare.count("/") >= 2
+    if bare.startswith("."):
+        return True
+    # Absolute: a known root, or a file-like last segment ("key.pem").
+    return bare.startswith(_KNOWN_FILE_ROOTS) or "." in bare.rsplit("/", 1)[-1]
 
 
 def redact_env_value(name: str, value: str) -> str:
@@ -260,7 +275,8 @@ def redact_compose_text(text: str) -> str:
             lines[idx] = line
             continue
         prefix, name, sep, value = m.group("prefix", "name", "sep", "value")
-        mapping_form = "-" not in prefix and sep.strip().startswith(":")
+        colon_form = sep.strip().startswith(":")
+        mapping_form = "-" not in prefix and colon_form
         if mapping_form and _YAML_ANCHOR_RE.match(value.strip()):
             # `key: &anchor` / `key: *alias` — YAML structure, not a value.
             # In `KEY=*Sup3r` or `- KEY=&x`, `*`/`&` are just characters.
@@ -268,7 +284,7 @@ def redact_compose_text(text: str) -> str:
             continue
         if (
             name in _COMPOSE_REFERENCE_KEYS
-            and mapping_form
+            and colon_form  # `- secrets: [a]` inside an x-extension list is fine too
             and _REFERENCE_VALUE_RE.match(value.strip())
         ):
             # `secrets: [a, b]` / `secrets: [` / `configs: {}` / `secrets: &x`

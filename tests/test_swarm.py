@@ -1014,7 +1014,7 @@ async def test_service_update_auto_matches_registry_for_private_image() -> None:
     assert json.loads(base64.b64decode(fake.update["headers"]["X-Registry-Auth"])) == {
         "registryId": 3
     }
-    # Official Docker Hub image: public, no lookup, no header, rollout proceeds.
+    # Docker Hub image, no DockerHub-type registry configured: no header.
     fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
     body = json.loads(
         _text(
@@ -1023,8 +1023,7 @@ async def test_service_update_auto_matches_registry_for_private_image() -> None:
             )
         )
     )
-    assert body["registry_id"] is None
-    assert body["credentials"] == "none (official Docker Hub image)"
+    assert body["registry_id"] is None and body["credentials"] == "none"
     assert fake.update is not None and fake.update["headers"] == {}
     # Force-only: no image, no lookup at all.
     fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
@@ -1047,8 +1046,15 @@ async def test_service_update_auto_matches_registry_for_private_image() -> None:
             )
         )
     )
-    assert body["credentials"] == "no new credentials (registry_id=0)"
-    assert fake.update is not None and fake.update["headers"] == {}
+    assert body["credentials"] == "anonymous (forced)"
+    # An explicit empty AuthConfig, not a missing header: Docker would
+    # otherwise reuse the credentials stored in the service spec.
+    assert fake.update is not None
+    assert json.loads(base64.b64decode(fake.update["headers"]["X-Registry-Auth"])) == {
+        "username": "",
+        "password": "",
+        "serveraddress": "",
+    }
 
 
 async def test_service_update_refuses_rollout_without_decided_credentials() -> None:
@@ -1085,3 +1091,25 @@ async def test_service_update_refuses_rollout_without_decided_credentials() -> N
         )
     )
     assert body["status"] == "updated" and body["credentials"] == "none"
+
+    # A failed *listing* is not ambiguity: proceed header-less, like a pull.
+    class _NoListing(_SwarmClient):
+        async def get(self, path: str, **kwargs: Any) -> Any:
+            if path.endswith("/registries"):
+                req = httpx.Request("GET", "https://x")
+                raise httpx.HTTPStatusError(
+                    "denied", request=req, response=httpx.Response(403, request=req)
+                )
+            return await super().get(path, **kwargs)
+
+    fake3 = _NoListing([_service("svc-a-id", "etl_backend")])
+    body = json.loads(
+        _text(
+            await _mcp(fake3).call_tool(
+                "portainer_service_update", {"service_id": "svc-a-id", "image": "reg.local/app:v2"}
+            )
+        )
+    )
+    assert body["status"] == "updated"
+    assert body["credentials"] == "none (registry listing failed)"
+    assert fake3.update is not None and fake3.update["headers"] == {}

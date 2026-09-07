@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
@@ -532,7 +533,7 @@ async def test_image_pull_success() -> None:
         "status": "pulled",
         "image": "nginx:1.25",
         "registry_id": None,
-        "credentials": "none (official Docker Hub image)",
+        "credentials": "none",
     }
     assert fake.params == {"fromImage": "nginx", "tag": "1.25"}
 
@@ -1729,25 +1730,19 @@ async def test_image_pull_docker_hub_matches_only_hub_type_registry() -> None:
     images.register(mcp)
     fake = _RegistryPullClient(_REGISTRIES)  # no DockerHub-type registry configured
     client_mod._client = fake  # type: ignore[assignment]
-    body = json.loads(_text(await mcp.call_tool("portainer_image_pull", {"image_name": "x/app"})))
-    assert body["registry_id"] is None and body["credentials"] == "none"
-    assert fake.headers == {}
-    # A DockerHub-type registry (Type 6, URL docker.io) matches a namespaced Hub repo…
+    for name in ("nginx", "x/app", "docker.io/library/nginx"):
+        body = json.loads(_text(await mcp.call_tool("portainer_image_pull", {"image_name": name})))
+        assert body["registry_id"] is None and body["credentials"] == "none", name
+        assert fake.headers == {}
+    # A DockerHub-type registry (Type 6, URL docker.io) matches every Hub image,
+    # official ones included: the token is what lifts the anonymous pull quota.
     hub = _RegistryPullClient(
         [*_REGISTRIES, {"Id": 11, "URL": "docker.io", "Type": 6, "Authentication": True}]
     )
     client_mod._client = hub  # type: ignore[assignment]
-    body = json.loads(
-        _text(await mcp.call_tool("portainer_image_pull", {"image_name": "ginkida/private"}))
-    )
-    assert body["registry_id"] == 11 and body["credentials"] == "portainer (auto)"
-    # …but never an official image: those are public and a stale token would break them.
-    for name in ("nginx", "library/nginx", "docker.io/library/nginx"):
+    for name in ("ginkida/private", "nginx", "docker.io:443/ginkida/private"):
         body = json.loads(_text(await mcp.call_tool("portainer_image_pull", {"image_name": name})))
-        assert body["registry_id"] is None, name
-        assert body["credentials"] == "none (official Docker Hub image)", name
-        assert hub.headers == {}
-    assert hub.registry_calls == 1  # official images never list registries
+        assert body["registry_id"] == 11 and body["credentials"] == "portainer (auto)", name
 
 
 async def test_image_pull_skips_unauthenticated_and_odd_listings() -> None:
@@ -1824,7 +1819,13 @@ async def test_image_pull_ambiguous_registries_fall_back_to_anonymous() -> None:
             )
         )
     )
-    assert body["credentials"] == "anonymous (forced)" and two.headers == {}
+    assert body["credentials"] == "anonymous (forced)"
+    assert two.headers is not None
+    assert json.loads(base64.b64decode(two.headers["X-Registry-Auth"])) == {
+        "username": "",
+        "password": "",
+        "serveraddress": "",
+    }
     body = json.loads(
         _text(
             await mcp.call_tool(
@@ -1882,7 +1883,8 @@ def test_image_registry_host_drops_default_ports() -> None:
         ("https://reg.local:5000/v2/", "reg.local:5000"),
         ("", ""),
         (None, ""),
-        ("https://reg.local:notaport/", "reg.local"),
+        ("https://reg.local:notaport/", ""),  # urlsplit rejects it: treated as no host
+        ("http://[bad", ""),
     ],
 )
 def test_registry_host_normalisation(url: Any, host: str) -> None:
