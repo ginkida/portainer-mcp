@@ -769,9 +769,7 @@ async def test_stack_inspect_reveal_env_returns_everything() -> None:
     mcp = FastMCP("t")
     stacks.register(mcp)
     client_mod._client = _StackInspectClient()  # type: ignore[assignment]
-    raw = _text(
-        await mcp.call_tool("portainer_stack_inspect", {"stack_id": 9, "reveal_env": True})
-    )
+    raw = _text(await mcp.call_tool("portainer_stack_inspect", {"stack_id": 9, "reveal_env": True}))
     body = json.loads(raw)
     assert body["env_redacted"] is False
     assert body["ComposeFileContent"] == _COMPOSE_WITH_SECRETS
@@ -1155,7 +1153,10 @@ async def test_container_logs_since_and_timestamps_forwarded() -> None:
         {"container_id": "abc", "since": "1700000000", "timestamps": True, "tail": 5},
     )
     assert fake.params == {
-        "stdout": "true", "stderr": "true", "tail": "5", "timestamps": "true",
+        "stdout": "true",
+        "stderr": "true",
+        "tail": "5",
+        "timestamps": "true",
         "since": "1700000000",
     }
     # Defaults: no since / timestamps keys at all (Docker treats "" oddly).
@@ -1319,3 +1320,158 @@ def test_parse_since_relative_and_empty() -> None:
 def test_parse_since_rejects(bad: str) -> None:
     with pytest.raises(ValueError, match="since"):
         containers._parse_since(bad)
+
+
+# --- docker_prune -----------------------------------------------------------------------
+
+
+class _PruneClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any] | None, Any]] = []
+
+    async def post(self, path: str, **kwargs: Any) -> Any:
+        self.calls.append((path, kwargs.get("params"), kwargs.get("timeout")))
+        return {
+            "ImagesDeleted": [{"Deleted": "a"}, {"Untagged": "b"}],
+            "SpaceReclaimed": 3 * 1_048_576,
+        }
+
+
+@pytest.mark.parametrize(
+    ("args", "path", "params"),
+    [
+        ({"target": "images"}, "images/prune", {"filters": '{"dangling": ["true"]}'}),
+        (
+            {"target": "images", "all_images": True},
+            "images/prune",
+            {"filters": '{"dangling": ["false"]}'},
+        ),
+        ({"target": "containers"}, "containers/prune", {}),
+        ({"target": "build_cache"}, "build/prune", {}),
+    ],
+)
+async def test_docker_prune_targets(
+    args: dict[str, Any], path: str, params: dict[str, Any]
+) -> None:
+    from portainer_mcp.tools import system
+
+    mcp = FastMCP("t")
+    system.register(mcp)
+    fake = _PruneClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool("portainer_docker_prune", args)))
+    assert body["status"] == "pruned"
+    assert body["space_reclaimed_mb"] == 3.0
+    called_path, called_params, timeout = fake.calls[0]
+    assert called_path.endswith(f"/docker/{path}")
+    assert called_params == params
+    assert timeout == 300.0  # long timeout
+
+
+@pytest.mark.parametrize("target", ["volumes", "everything", ""])
+async def test_docker_prune_rejects_volumes_and_unknown(target: str) -> None:
+    from portainer_mcp.tools import system
+
+    mcp = FastMCP("t")
+    system.register(mcp)
+    fake = _PruneClient()
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool("portainer_docker_prune", {"target": target})))
+    assert body["error"] == "Validation error"
+    assert fake.calls == []
+
+
+# --- stack deploy/update: long timeout + git guard ------------------------------------------
+
+
+async def test_stack_update_and_deploy_use_long_timeout() -> None:
+    class _Client(_StackUpdateClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.timeouts: list[Any] = []
+
+        async def put(self, path: str, **kwargs: Any) -> Any:
+            self.timeouts.append(kwargs.get("timeout"))
+            return await super().put(path, **kwargs)
+
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _Client()
+    client_mod._client = fake  # type: ignore[assignment]
+    await mcp.call_tool("portainer_stack_update", {"stack_id": 9})
+    assert fake.timeouts == [300.0]
+
+    class _Deploy(_DeployClient):
+        async def post(self, path: str, **kwargs: Any) -> Any:
+            self.timeout = kwargs.get("timeout")
+            return await super().post(path, **kwargs)
+
+    deploy = _Deploy(False)
+    client_mod._client = deploy  # type: ignore[assignment]
+    await mcp.call_tool(
+        "portainer_stack_deploy", {"name": "demo", "compose_content": "services: {}"}
+    )
+    assert deploy.timeout == 300.0
+
+
+async def test_stack_update_refuses_git_backed_stack_unless_detached() -> None:
+    class _Git(_StackUpdateClient):
+        async def get(self, path: str, **kwargs: Any) -> Any:
+            data = await super().get(path, **kwargs)
+            if path == "/api/stacks/9":
+                data["GitConfig"] = {"URL": "https://git.example/repo", "ReferenceName": "main"}
+            return data
+
+    mcp = FastMCP("t")
+    stacks.register(mcp)
+    fake = _Git()
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool("portainer_stack_update", {"stack_id": 9})))
+    assert body["error"] == "Validation error"
+    assert "git-backed" in body["details"] and "detach_from_git" in body["details"]
+    assert fake.put_body is None
+    body = json.loads(
+        _text(
+            await mcp.call_tool("portainer_stack_update", {"stack_id": 9, "detach_from_git": True})
+        )
+    )
+    assert body["status"] == "updated"
+    assert fake.put_body is not None
+
+
+# --- _cap_lines: a single oversized line is sliced, never dropped to nothing ---------------
+
+
+def test_cap_lines_keeps_partial_first_line() -> None:
+    huge = "x" * 5000
+    kept, truncated = containers._cap_lines([huge, "second"], 1000)
+    assert truncated is True
+    assert len(kept) == 1
+    assert kept[0].startswith("xxxx") and "line truncated: 5000 chars" in kept[0]
+    assert len(kept[0]) <= 1000
+    # Whole-line dropping still applies when the tail line is the one over budget.
+    kept, truncated = containers._cap_lines(["a" * 10, "b" * 50], 30)
+    assert kept == ["a" * 10] and truncated is True
+    # Too little room for a meaningful slice -> drop it rather than emit a stub.
+    kept, truncated = containers._cap_lines(["a" * 10, huge], 100)
+    assert kept == ["a" * 10] and truncated is True
+    assert containers._cap_lines(["a", "b"], 100) == (["a", "b"], False)
+
+
+async def test_logs_grep_matches_only_first_8k_of_a_line() -> None:
+    class _LongLine:
+        async def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+            return httpx.Response(200, content=b"x" * 9000 + b"NEEDLE\nNEEDLE early\n")
+
+    mcp = FastMCP("t")
+    containers.register(mcp)
+    client_mod._client = _LongLine()  # type: ignore[assignment]
+    body = json.loads(
+        _text(
+            await mcp.call_tool(
+                "portainer_container_logs_grep", {"container_id": "abc", "pattern": "NEEDLE"}
+            )
+        )
+    )
+    assert body["matches_found"] == 1
+    assert body["lines"] == ["NEEDLE early"]

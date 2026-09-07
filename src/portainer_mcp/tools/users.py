@@ -32,7 +32,7 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         users = await client.get("/api/users")
         result = []
-        for u in users:
+        for u in users or []:
             result.append({
                 "id": u["Id"],
                 "username": u["Username"],

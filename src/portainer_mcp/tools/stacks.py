@@ -153,7 +153,7 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         stacks = await client.get("/api/stacks")
         result = []
-        for s in stacks:
+        for s in stacks or []:
             result.append(
                 {
                     "id": s["Id"],
@@ -265,6 +265,8 @@ def register(mcp: FastMCP) -> None:
             f"/api/stacks/create/{deploy_type}/string",
             params={"endpointId": eid},
             json=body,
+            # Portainer deploys synchronously (image pulls included).
+            timeout=config.long_timeout,
         )
         if result:
             if isinstance(result, dict) and isinstance(result.get("Env"), list):
@@ -281,6 +283,7 @@ def register(mcp: FastMCP) -> None:
         env_remove: list[str] | None = None,
         prune: bool | None = None,
         pull_image: bool | None = None,
+        detach_from_git: bool = False,
         endpoint_id: int | None = None,
     ) -> str:
         """Update (redeploy) an existing stack.
@@ -305,6 +308,9 @@ def register(mcp: FastMCP) -> None:
                 Defaults to the stack's current setting.
             pull_image: Force re-pulling images before redeploying
                 (Portainer's "Re-pull image and redeploy"; default false)
+            detach_from_git: Required to update a git-backed stack — Portainer
+                converts it to a plain file-based stack and drops the git
+                link and auto-update. Refused otherwise.
             endpoint_id: Endpoint ID (derived from the stack itself if omitted)
         """
         validate_id(stack_id, "stack_id")
@@ -312,10 +318,20 @@ def register(mcp: FastMCP) -> None:
             _validate_compose_content(compose_content)
         _validate_env(env, env_remove)
         client = get_client()
+        config = get_config()
 
         # Always read the stack first: we need its Env (to preserve it), its
         # Prune option (default "as configured"), and its endpoint.
         stack = await _load_stack(client, stack_id)
+        if stack.get("GitConfig") and not detach_from_git:
+            # Portainer's update-by-content handler sets GitConfig = nil: the
+            # stack silently stops following its repository.
+            raise ValueError(
+                f"Stack {stack_id} ({stack.get('Name')!r}) is git-backed; updating it "
+                "by content would detach it from its repository and disable "
+                "auto-update. Pass detach_from_git=true to do that deliberately, "
+                "or update it from the Portainer UI (git pull)."
+            )
         eid = await _stack_endpoint(client, stack, endpoint_id)
 
         current_env = _pairs_to_dict(stack.get("Env"))
@@ -363,6 +379,8 @@ def register(mcp: FastMCP) -> None:
             f"/api/stacks/{stack_id}",
             params={"endpointId": eid},
             json=body,
+            # Synchronous redeploy; with pull_image it also pulls every image.
+            timeout=config.long_timeout,
         )
         summary = {
             "status": "updated",
@@ -424,7 +442,11 @@ def register(mcp: FastMCP) -> None:
         stack = await _load_stack(client, stack_id)
         eid = await _stack_endpoint(client, stack, endpoint_id)
         logger.info("AUDIT: Starting stack %d on endpoint %d", stack_id, eid)
-        result = await client.post(f"/api/stacks/{stack_id}/start", params={"endpointId": eid})
+        result = await client.post(
+            f"/api/stacks/{stack_id}/start",
+            params={"endpointId": eid},
+            timeout=get_config().long_timeout,
+        )
         if isinstance(result, dict):
             if isinstance(result.get("Env"), list):
                 result["Env"] = redact_env_pairs(result["Env"])
@@ -452,7 +474,11 @@ def register(mcp: FastMCP) -> None:
         stack = await _load_stack(client, stack_id)
         eid = await _stack_endpoint(client, stack, endpoint_id)
         logger.info("AUDIT: Stopping stack %d on endpoint %d", stack_id, eid)
-        result = await client.post(f"/api/stacks/{stack_id}/stop", params={"endpointId": eid})
+        result = await client.post(
+            f"/api/stacks/{stack_id}/stop",
+            params={"endpointId": eid},
+            timeout=get_config().long_timeout,
+        )
         if isinstance(result, dict):
             if isinstance(result.get("Env"), list):
                 result["Env"] = redact_env_pairs(result["Env"])

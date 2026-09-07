@@ -103,7 +103,7 @@ def register(mcp: FastMCP) -> None:
             f"/api/endpoints/{eid}/docker/images/json", params=params
         )
         result = []
-        for img in images:
+        for img in images or []:
             result.append({
                 "id": img["Id"][:19],
                 "tags": img.get("RepoTags", []),

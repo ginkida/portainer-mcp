@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from .config import get_config
+from .errors import PortainerResponseError
 
 logger = logging.getLogger(__name__)
 
@@ -214,18 +215,28 @@ class PortainerClient:
 
     @staticmethod
     def _decode(resp: httpx.Response) -> Any:
-        """Decode a successful response body, tolerating empty/non-JSON bodies.
+        """Decode a successful response body.
 
-        Some Portainer/Docker endpoints return 200 with an empty body (e.g.
-        network connect/disconnect) — treating that as an error would report a
-        successful mutation as failed.
+        204 and empty bodies decode to ``None`` (network connect/disconnect and
+        friends answer 200 with nothing — that is success, not an error). A
+        *non-empty* body that is not JSON is a different story: it means we
+        are not talking to Portainer's API (a proxy's HTML page, most often),
+        and every caller would otherwise trip over ``None`` with an opaque
+        "Internal error". Raise something descriptive instead.
         """
         if resp.status_code == 204 or not resp.content:
             return None
         try:
             return resp.json()
         except (ValueError, httpx.DecodingError):
-            return None
+            content_type = resp.headers.get("content-type", "unknown")
+            preview = resp.text[:200].replace("\n", " ")
+            raise PortainerResponseError(
+                f"Portainer returned a non-JSON {resp.status_code} response "
+                f"(content-type {content_type}) for {resp.request.method} "
+                f"{resp.request.url.path}. Is PORTAINER_URL pointing at Portainer "
+                f"itself rather than a proxy login page? Body starts: {preview!r}"
+            ) from None
 
     async def get(self, path: str, **kwargs: Any) -> Any:
         resp = await self.request("GET", path, **kwargs)

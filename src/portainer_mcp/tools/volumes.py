@@ -48,7 +48,7 @@ def register(mcp: FastMCP) -> None:
         data = await client.get(
             f"/api/endpoints/{eid}/docker/volumes", params=params
         )
-        volumes = data.get("Volumes") or []
+        volumes = (data or {}).get("Volumes") or []
         result = []
         for v in volumes:
             result.append({

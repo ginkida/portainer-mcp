@@ -33,6 +33,9 @@ _MAX_STACK_TARGETS = 500
 # a worker thread under an overall deadline so it can never wedge the event loop.
 _MAX_GREP_PATTERN_CHARS = 512
 _GREP_SCAN_TIMEOUT = 5.0
+# Only the first N chars of each line are matched: catastrophic backtracking
+# grows with input length, and no useful log line needs more than this.
+_MAX_GREP_LINE_CHARS = 8192
 
 # Docker labels that tie a container to its stack / service (Swarm and Compose).
 _STACK_LABELS = ("com.docker.stack.namespace", "com.docker.compose.project")
@@ -208,17 +211,31 @@ def _stack_targets(
     return targets
 
 
+# When a single line blows the output budget, keep this much of it (plus a
+# marker) rather than returning nothing: one giant JSON dump or minified stack
+# trace must not turn a 100K budget into an empty answer.
+_MIN_PARTIAL_LINE_CHARS = 200
+_LINE_TRUNCATED_MARKER = " …[line truncated: {total} chars]"
+
+
 def _cap_lines(lines: list[str], budget: int) -> tuple[list[str], bool]:
     """Trim ``lines`` so their combined size fits ``budget`` characters.
 
     Data is capped *before* JSON serialization so the tool output stays valid
-    JSON (slicing a serialized document would cut mid-string). Returns the
-    kept lines and whether anything was dropped.
+    JSON (slicing a serialized document would cut mid-string). Whole lines are
+    dropped from the end; the one line that doesn't fit is kept as a partial
+    slice when there is meaningful room left for it, so a single oversized
+    line can never make the result empty. Returns the kept lines and whether
+    anything was dropped or cut.
     """
     total = 0
     for idx, line in enumerate(lines):
         total += len(line) + 1
         if total > budget:
+            remaining = budget - (total - len(line) - 1)
+            marker = _LINE_TRUNCATED_MARKER.format(total=len(line))
+            if remaining - len(marker) >= _MIN_PARTIAL_LINE_CHARS:
+                return [*lines[:idx], line[: remaining - len(marker)] + marker], True
             return lines[:idx], True
     return lines, False
 
@@ -259,7 +276,7 @@ def register(mcp: FastMCP) -> None:
             params=params,
         )
         result = []
-        for c in containers:
+        for c in containers or []:
             # Swarm and Compose use different label keys, so the stack match
             # is done client-side (Docker's label filter can't express OR).
             stack, service = _container_labels(c)
@@ -507,15 +524,26 @@ def register(mcp: FastMCP) -> None:
 
         # A user-supplied regex can backtrack catastrophically. Run the whole
         # scan in a worker thread under a hard deadline so a pathological
-        # pattern can never block the event loop / freeze the server.
+        # pattern can never block the event loop / freeze the server. The
+        # worker also checks the deadline itself between lines and only
+        # matches the first _MAX_GREP_LINE_CHARS of each, so a timed-out scan
+        # stops burning a CPU core soon after the caller has given up.
+        deadline = time.monotonic() + _GREP_SCAN_TIMEOUT
+
         def _scan(buf: list[str]) -> list[int]:
-            return [i for i, line in enumerate(buf) if regex.search(line)]
+            hits: list[int] = []
+            for i, line in enumerate(buf):
+                if time.monotonic() > deadline:
+                    raise TimeoutError
+                if regex.search(line[:_MAX_GREP_LINE_CHARS]):
+                    hits.append(i)
+            return hits
 
         try:
             hit_indices = await asyncio.wait_for(
                 asyncio.to_thread(_scan, lines), timeout=_GREP_SCAN_TIMEOUT
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             raise ValueError(
                 "Regex search timed out (pattern too complex for this log volume)"
             ) from None

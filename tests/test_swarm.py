@@ -611,15 +611,25 @@ async def test_stack_status_compose_project_on_swarm_manager() -> None:
     with Compose labels — report them instead of "nothing found"."""
     containers = [
         {
-            "Id": "a" * 64, "Names": ["/mon-grafana-1"], "Image": "grafana", "State": "running",
-            "Status": "Up", "Labels": {
-                "com.docker.compose.project": "mon", "com.docker.compose.service": "grafana",
+            "Id": "a" * 64,
+            "Names": ["/mon-grafana-1"],
+            "Image": "grafana",
+            "State": "running",
+            "Status": "Up",
+            "Labels": {
+                "com.docker.compose.project": "mon",
+                "com.docker.compose.service": "grafana",
             },
         },
         {
-            "Id": "b" * 64, "Names": ["/mon-init-1"], "Image": "busybox", "State": "exited",
-            "Status": "Exited (0) 2 hours ago", "Labels": {
-                "com.docker.compose.project": "mon", "com.docker.compose.service": "init",
+            "Id": "b" * 64,
+            "Names": ["/mon-init-1"],
+            "Image": "busybox",
+            "State": "exited",
+            "Status": "Exited (0) 2 hours ago",
+            "Labels": {
+                "com.docker.compose.project": "mon",
+                "com.docker.compose.service": "init",
             },
         },
     ]
@@ -708,3 +718,281 @@ async def test_service_inspect_and_nodes_reject_empty_body() -> None:
     assert "no data" in body["details"]
     body = json.loads(_text(await _mcp(_Empty()).call_tool("portainer_nodes_list", {})))
     assert body["error"] == "Validation error"
+
+
+# --- cron-driven services (swarm-cronjob) -------------------------------------------
+
+
+def _cron_service(sid: str, name: str) -> dict[str, Any]:
+    svc = _service(sid, name, replicas=1, update_state="paused")
+    svc["Spec"]["Labels"].update(
+        {"swarm.cronjob.enable": "true", "swarm.cronjob.schedule": "0 * * * * *"}
+    )
+    return svc
+
+
+def _cron_task(tid: str, sid: str, *, ts: str, exit_code: int = 0, state: str = "complete") -> Any:
+    t = _task(tid, sid, state=state, desired="shutdown", ts=ts)
+    t["Status"]["ContainerStatus"]["ExitCode"] = exit_code
+    if exit_code:
+        t["Status"]["Err"] = f"task: non-zero exit ({exit_code})"
+        t["Status"]["State"] = "failed"
+    return t
+
+
+async def test_cron_service_is_healthy_when_last_run_succeeded() -> None:
+    """0/1 running + "update paused" is a cron job's resting state, not an outage."""
+    cron = _cron_service("cron-id", "etl_scheduler")
+    tasks = [
+        _cron_task("r1", "cron-id", ts="2026-01-03T00:00:00Z"),
+        _cron_task("r0", "cron-id", ts="2026-01-02T00:00:00Z", exit_code=1),  # older failure
+    ]
+    fake = _SwarmClient(
+        [cron, _service("svc-a-id", "etl_backend")],
+        tasks + [_task("t1", "svc-a-id"), _task("t2", "svc-a-id", slot=2)],
+    )
+    body = json.loads(
+        _text(await _mcp(fake).call_tool("portainer_stack_status", {"stack_name": "etl"}))
+    )
+    assert body["healthy"] is True
+    sched = next(s for s in body["services"] if s["name"] == "etl_scheduler")
+    assert sched["cron"] is True
+    assert sched["cron_schedule"] == "0 * * * * *"
+    assert sched["healthy"] is True
+    assert sched["last_run_state"] == "complete"
+    assert sched["last_run_exit_code"] == 0
+    assert sched["replicas_running"] == 0  # still reported, just not judged on
+    assert sched["recent_task_errors"] == []  # the old failure predates the good run
+    listing = json.loads(_text(await _mcp(fake).call_tool("portainer_services_list", {})))
+    assert next(s for s in listing if s["name"] == "etl_scheduler")["cron"] is True
+
+
+async def test_cron_service_is_unhealthy_when_last_run_failed() -> None:
+    cron = _cron_service("cron-id", "etl_scheduler")
+    tasks = [
+        _cron_task("r1", "cron-id", ts="2026-01-03T00:00:00Z", exit_code=137),
+        _cron_task("r0", "cron-id", ts="2026-01-02T00:00:00Z"),
+    ]
+    fake = _SwarmClient([cron], tasks)
+    body = json.loads(
+        _text(await _mcp(fake).call_tool("portainer_stack_status", {"stack_name": "etl"}))
+    )
+    sched = body["services"][0]
+    assert sched["healthy"] is False
+    assert sched["last_run_exit_code"] == 137
+    assert [e["error"] for e in sched["recent_task_errors"]] == ["task: non-zero exit (137)"]
+    assert body["healthy"] is False
+
+
+async def test_recent_task_errors_hidden_once_a_newer_task_runs() -> None:
+    """Historical failures older than the newest running task are noise."""
+    tasks = [
+        _task("ok", "svc-a-id", slot=1, ts="2026-01-05T00:00:00Z"),
+        _task(
+            "old",
+            "svc-a-id",
+            slot=1,
+            state="rejected",
+            err="network sandbox join failed",
+            ts="2026-01-01T00:00:00Z",
+        ),
+        _task("ok2", "svc-a-id", slot=2, ts="2026-01-05T00:00:00Z"),
+    ]
+    fake = _SwarmClient([_service("svc-a-id", "etl_backend", replicas=2)], tasks)
+    body = json.loads(
+        _text(await _mcp(fake).call_tool("portainer_stack_status", {"stack_name": "etl"}))
+    )
+    assert body["services"][0]["healthy"] is True
+    assert body["services"][0]["recent_task_errors"] == []
+    # ...but a failure newer than the last good task is reported.
+    tasks.append(
+        _task(
+            "new",
+            "svc-a-id",
+            slot=2,
+            state="failed",
+            err="task: non-zero exit (1)",
+            ts="2026-01-06T00:00:00Z",
+        )
+    )
+    body = json.loads(
+        _text(await _mcp(fake).call_tool("portainer_stack_status", {"stack_name": "etl"}))
+    )
+    assert [e["id"] for e in body["services"][0]["recent_task_errors"]] == ["new"]
+
+
+# --- service_rollback ------------------------------------------------------------------
+
+
+async def test_service_rollback_sends_rollback_flag() -> None:
+    svc = _service(
+        "svc-a-id", "etl_backend", version=7, image="reg.local/app:v2@sha256:" + "b" * 64
+    )
+    svc["PreviousSpec"] = json.loads(json.dumps(svc["Spec"]))
+    svc["PreviousSpec"]["TaskTemplate"]["ContainerSpec"]["Image"] = (
+        "reg.local/app:v1@sha256:" + "a" * 64
+    )
+    fake = _SwarmClient([svc])
+    body = json.loads(
+        _text(
+            await _mcp(fake).call_tool("portainer_service_rollback", {"service_id": "etl_backend"})
+        )
+    )
+    assert body["status"] == "rollback_started"
+    assert body["image"] == {"from": "reg.local/app:v2", "to": "reg.local/app:v1"}
+    assert fake.update is not None
+    assert fake.update["params"] == {"version": "7", "rollback": "previous"}
+    assert fake.update["json"]["Name"] == "etl_backend"
+
+
+async def test_service_rollback_requires_previous_spec() -> None:
+    fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
+    body = json.loads(
+        _text(await _mcp(fake).call_tool("portainer_service_rollback", {"service_id": "svc-a-id"}))
+    )
+    assert body["error"] == "Validation error"
+    assert "no previous spec" in body["details"]
+    assert fake.update is None
+
+
+# --- wait tools ---------------------------------------------------------------------------
+
+
+class _EvolvingClient(_SwarmClient):
+    """Task list changes on every /tasks call: first calls see 0 running, then 2."""
+
+    def __init__(self, services: list[dict[str, Any]], phases: list[list[dict[str, Any]]]) -> None:
+        super().__init__(services, [])
+        self.phases = phases
+        self.polls = 0
+
+    async def get(self, path: str, **kwargs: Any) -> Any:
+        if path.endswith("/docker/tasks"):
+            self.tasks = self.phases[min(self.polls, len(self.phases) - 1)]
+            self.polls += 1
+        return await super().get(path, **kwargs)
+
+
+@pytest.fixture
+def fast_polling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(swarm, "_WAIT_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(swarm, "_MIN_WAIT_SECONDS", 0)
+
+
+async def test_service_wait_converges_when_replicas_come_up(fast_polling: None) -> None:
+    svc = _service("svc-a-id", "etl_backend", replicas=2, update_state="completed")
+    phases = [
+        [_task("t1", "svc-a-id", slot=1, state="starting")],
+        [_task("t1", "svc-a-id", slot=1), _task("t2", "svc-a-id", slot=2)],
+    ]
+    fake = _EvolvingClient([svc], phases)
+    body = json.loads(
+        _text(
+            await _mcp(fake).call_tool(
+                "portainer_service_wait", {"service_id": "svc-a-id", "timeout_seconds": 30}
+            )
+        )
+    )
+    assert body["converged"] is True
+    assert body["reason"] == "healthy"
+    assert body["timed_out"] is False
+    assert body["replicas_running"] == 2
+    assert fake.polls == 2
+
+
+async def test_service_wait_stops_on_paused_update(fast_polling: None) -> None:
+    svc = _service("svc-a-id", "etl_backend", replicas=2, update_state="paused")
+    tasks = [_task("t1", "svc-a-id", slot=1, state="failed", err="task: non-zero exit (1)")]
+    fake = _SwarmClient([svc], tasks)
+    body = json.loads(
+        _text(await _mcp(fake).call_tool("portainer_service_wait", {"service_id": "svc-a-id"}))
+    )
+    assert body["converged"] is True
+    assert body["reason"].startswith("update paused")
+    assert body["healthy"] is False
+    assert body["recent_task_errors"][0]["error"] == "task: non-zero exit (1)"
+
+
+async def test_service_wait_times_out(fast_polling: None) -> None:
+    svc = _service("svc-a-id", "etl_backend", replicas=2, update_state="updating")
+    fake = _SwarmClient([svc], [_task("t1", "svc-a-id", slot=1, state="starting")])
+    body = json.loads(
+        _text(
+            await _mcp(fake).call_tool(
+                "portainer_service_wait", {"service_id": "svc-a-id", "timeout_seconds": 0}
+            )
+        )
+    )
+    assert body["converged"] is False
+    assert body["timed_out"] is True
+    assert body["reason"] == "timed out"
+    assert body["timeout_seconds"] == 0
+
+
+def test_clamp_wait_bounds() -> None:
+    assert swarm._clamp_wait(0) == 5
+    assert swarm._clamp_wait(60) == 60
+    assert swarm._clamp_wait(10_000) == 300  # config.long_timeout default
+
+
+async def test_stack_wait_converges_and_reports_stuck(fast_polling: None) -> None:
+    svc = _service("svc-a-id", "etl_backend", replicas=1)
+    fake = _EvolvingClient([svc], [[], [_task("t1", "svc-a-id")]])
+    body = json.loads(
+        _text(await _mcp(fake).call_tool("portainer_stack_wait", {"stack_name": "etl"}))
+    )
+    assert body["converged"] is True and body["reason"] == "healthy"
+    assert body["services"][0]["healthy"] is True
+    assert fake.polls == 2
+
+    stuck = _service("svc-b-id", "etl_worker", replicas=1, update_state="paused")
+    fake2 = _SwarmClient([svc, stuck], [_task("t1", "svc-a-id")])
+    body = json.loads(
+        _text(await _mcp(fake2).call_tool("portainer_stack_wait", {"stack_name": "etl"}))
+    )
+    assert body["converged"] is True
+    assert body["timed_out"] is False
+    assert "etl_worker" in body["reason"]
+
+    fake3 = _SwarmClient([svc], [])
+    body = json.loads(
+        _text(
+            await _mcp(fake3).call_tool(
+                "portainer_stack_wait", {"stack_name": "etl", "timeout_seconds": 0}
+            )
+        )
+    )
+    assert body["converged"] is False and body["timed_out"] is True
+
+
+# --- secrets / configs ---------------------------------------------------------------------
+
+
+class _ObjectsClient(_SwarmClient):
+    async def get(self, path: str, **kwargs: Any) -> Any:
+        if path.endswith("/docker/secrets") or path.endswith("/docker/configs"):
+            return [
+                {
+                    "ID": "obj-2-id-xxxxxxxxxxxxxx",
+                    "CreatedAt": "c",
+                    "UpdatedAt": "u",
+                    "Spec": {"Name": "zeta", "Labels": {"a": "b"}, "Data": "c2VjcmV0LWNhbmFyeQ=="},
+                },
+                {"ID": "obj-1-id", "Spec": {"Name": "alpha", "Data": "content-canary"}},
+            ]
+        return await super().get(path, **kwargs)
+
+
+@pytest.mark.parametrize("tool", ["portainer_secrets_list", "portainer_configs_list"])
+async def test_swarm_object_lists_never_return_data(tool: str) -> None:
+    raw = _text(await _mcp(_ObjectsClient()).call_tool(tool, {}))
+    assert "canary" not in raw and "c2VjcmV0" not in raw
+    body = json.loads(raw)
+    assert [o["name"] for o in body] == ["alpha", "zeta"]
+    assert body[1] == {
+        "id": "obj-2-id-xxx",
+        "name": "zeta",
+        "labels": {"a": "b"},
+        "created_at": "c",
+        "updated_at": "u",
+    }

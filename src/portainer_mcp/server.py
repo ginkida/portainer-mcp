@@ -42,7 +42,11 @@ file. Values shown as [REDACTED] are masked credentials — never write them bac
 env / env_remove arguments to change them, and pull_image=true to roll out a new \
 build of a :latest image. A plain redeploy reuses the images already on the nodes.
 - To restart or re-pull a single Swarm service, use portainer_service_update \
-(force_restart / image / replicas) instead of touching its containers.
+(force_restart / image / replicas) instead of touching its containers; \
+portainer_service_rollback undoes the last update. After any rollout call \
+portainer_stack_wait / portainer_service_wait to confirm it converged instead of \
+polling by hand. Cron-driven services (cron: true) rest at 0 replicas — judge them \
+by last_run_state, not by replicas.
 - Private registries configured in Portainer are used by passing registry_id \
 (see portainer_registries_list); never ask for registry passwords.
 """

@@ -50,7 +50,7 @@ def register(mcp: FastMCP) -> None:
             f"/api/endpoints/{eid}/docker/networks", params=params
         )
         result = []
-        for n in networks:
+        for n in networks or []:
             result.append({
                 "id": n["Id"][:12],
                 "name": n.get("Name"),

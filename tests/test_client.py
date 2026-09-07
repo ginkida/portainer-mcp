@@ -208,9 +208,7 @@ def test_enforce_response_size_rejects_oversized() -> None:
     with pytest.raises(ValueError):
         PortainerClient._enforce_response_size(too_big)
     # Within limit / missing header must not raise.
-    PortainerClient._enforce_response_size(
-        httpx.Response(200, headers={"content-length": "100"})
-    )
+    PortainerClient._enforce_response_size(httpx.Response(200, headers={"content-length": "100"}))
     PortainerClient._enforce_response_size(httpx.Response(200))
 
 
@@ -413,3 +411,25 @@ async def test_api_key_mode_does_not_retry_401(monkeypatch: pytest.MonkeyPatch) 
 
     assert excinfo.value.response.status_code == 401
     assert calls == {"data": 1, "auth": 0}  # a static key can't be refreshed
+
+
+async def test_non_json_200_body_raises_descriptive_error() -> None:
+    """A proxy's HTML page must not become `None` -> 'Internal error'."""
+    from portainer_mcp.errors import PortainerResponseError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bootstrap = _auth_ok(request)
+        if bootstrap is not None:
+            return bootstrap
+        return httpx.Response(
+            200, content=b"<html><body>Sign in</body></html>", headers={"content-type": "text/html"}
+        )
+
+    client = build_client(handler)
+    try:
+        with pytest.raises(PortainerResponseError) as excinfo:
+            await client.get("/api/stacks")
+    finally:
+        await client.close()
+    msg = str(excinfo.value)
+    assert "text/html" in msg and "/api/stacks" in msg and "Sign in" in msg

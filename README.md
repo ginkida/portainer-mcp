@@ -9,7 +9,7 @@
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
 [![PyPI](https://img.shields.io/pypi/v/portainer-mcp)](https://pypi.org/project/portainer-mcp/)
 
-An MCP (Model Context Protocol) server that gives AI assistants — Claude, Copilot, Cursor, and others — **47 tools to manage Portainer container environments**: deploy and update stacks (Env preserved, re-pull on demand), inspect Swarm services/tasks/nodes, manage containers/images/volumes/networks, exec commands, analyze logs, and inspect endpoints — all through natural language. Two optional Laravel helpers bring the total to 49.
+An MCP (Model Context Protocol) server that gives AI assistants — Claude, Copilot, Cursor, and others — **53 tools to manage Portainer container environments**: deploy and update stacks (Env preserved, re-pull on demand), inspect Swarm services/tasks/nodes, manage containers/images/volumes/networks, exec commands, analyze logs, and inspect endpoints — all through natural language. Two optional Laravel helpers bring the total to 55.
 
 > **For LLM agents:** This server connects via stdio transport and ships server instructions (start with services on Swarm, inspect before update). Every tool returns JSON. All mutating operations are audit-logged. Credential-looking values are masked as `[REDACTED]` unless you ask for `reveal_env=true`. Credentials are passed via environment variables, never hardcoded.
 
@@ -212,7 +212,7 @@ All values are validated at startup — a malformed URL, a non-numeric timeout, 
 
 ## Tools
 
-All 47 tools are listed below with their parameters and descriptions (49 with the Laravel helpers enabled). Every tool returns JSON.
+All 53 tools are listed below with their parameters and descriptions (55 with the Laravel helpers enabled). Every tool returns JSON.
 
 ### Authentication
 
@@ -234,8 +234,9 @@ All 47 tools are listed below with their parameters and descriptions (49 with th
 | `portainer_stacks_list()` | List all stacks with id, name, type (`swarm`/`compose`), status, endpoint_id. |
 | `portainer_stack_inspect(stack_id, reveal_env?)` | Get stack details, its Env variables and the compose file. Credential-looking values (`*PASSWORD`, `*SECRET`, `*TOKEN`, `*KEY`, DSNs, …) are masked as `[REDACTED]` unless `reveal_env=true`. |
 | `portainer_stack_deploy(name, compose_content, env?, endpoint_id?)` | Deploy a new stack with optional Env variables. Auto-detects Swarm vs standalone. |
-| `portainer_stack_update(stack_id, compose_content?, env?, env_remove?, prune?, pull_image?, endpoint_id?)` | Redeploy a stack. **The stored Env variables are always preserved** (Portainer replaces the whole list on every update; the tool reads it first and merges `env` / `env_remove` into it). `prune` defaults to the stack's current setting; `pull_image=true` is Portainer's "Re-pull image and redeploy" — required to roll out a new build of a `:latest` tag. A compose file containing `[REDACTED]` is rejected. `endpoint_id` is derived from the stack itself. |
-| `portainer_stack_status(stack_name, endpoint_id?)` | Health summary: every service with running/desired replicas, update state and its most recent task failures. Falls back to container states on a standalone endpoint. |
+| `portainer_stack_update(stack_id, compose_content?, env?, env_remove?, prune?, pull_image?, detach_from_git?, endpoint_id?)` | Redeploy a stack. **The stored Env variables are always preserved** (Portainer replaces the whole list on every update; the tool reads it first and merges `env` / `env_remove` into it). `prune` defaults to the stack's current setting; `pull_image=true` is Portainer's "Re-pull image and redeploy" — required to roll out a new build of a `:latest` tag. A compose file containing `[REDACTED]` is rejected. A git-backed stack is refused unless `detach_from_git=true` (Portainer would silently drop the git link). `endpoint_id` is derived from the stack itself. |
+| `portainer_stack_status(stack_name, endpoint_id?)` | Health summary: every service with running/desired replicas, update state and the task failures newer than its last good task. Cron-driven services (swarm-cronjob labels) are judged on their last run, not on replicas. Falls back to container states on a standalone endpoint (or for a Compose project on a manager). |
+| `portainer_stack_wait(stack_name, timeout_seconds?, endpoint_id?)` | Poll `stack_status` after an update until every service is healthy, a rollout pauses on failure, or the timeout (default 120 s) elapses. Returns the final status plus `converged` / `reason` / `timed_out`. |
 | `portainer_stack_delete(stack_id, endpoint_id?)` | Delete a stack (endpoint derived from the stack; a different `endpoint_id` is accepted only for an orphaned stack whose endpoint no longer exists). |
 | `portainer_stack_start(stack_id, endpoint_id?)` | Start a stopped stack (endpoint derived from the stack). |
 | `portainer_stack_stop(stack_id, endpoint_id?)` | Stop a running stack (endpoint derived from the stack). |
@@ -249,6 +250,10 @@ All 47 tools are listed below with their parameters and descriptions (49 with th
 | `portainer_service_tasks(service_id, limit?, endpoint_id?)` | `docker service ps`: tasks by slot with state, node hostname, container id and the scheduler / start **error** — the first place to look when replicas won't come up. |
 | `portainer_service_logs(service_id, tail?, since?, timestamps?, endpoint_id?)` | Aggregated logs of all the service's tasks across nodes. |
 | `portainer_service_update(service_id, image?, replicas?, force_restart?, registry_id?, endpoint_id?)` | `docker service update`: change the image, scale, or `--force` a restart (reads the current spec + version, submits it back). Pass `image` without a digest to make Swarm resolve the tag's current digest; `force_restart` alone re-creates tasks with the pinned digest. `registry_id` makes Portainer supply stored registry credentials. |
+| `portainer_service_rollback(service_id, endpoint_id?)` | `docker service rollback`: revert to the previous spec (requires a prior update). |
+| `portainer_service_wait(service_id, timeout_seconds?, endpoint_id?)` | Poll until the service is healthy and its update finished, the update paused on failure, or the timeout elapses. Returns the service summary with `converged` / `reason` and recent task errors. |
+| `portainer_secrets_list(endpoint_id?)` | Swarm secrets: names and metadata only, never values. |
+| `portainer_configs_list(endpoint_id?)` | Swarm configs: names and metadata only, never content. |
 | `portainer_nodes_list(endpoint_id?)` | Swarm nodes: hostname, role, availability, state, leader, engine version, CPUs/memory, labels. |
 
 ### Containers
@@ -310,6 +315,7 @@ All 47 tools are listed below with their parameters and descriptions (49 with th
 |---|---|
 | `portainer_docker_info(endpoint_id?)` | OS, CPU, memory, container/image counts, swarm state. |
 | `portainer_docker_disk_usage(endpoint_id?)` | Per-category disk usage (containers, images, volumes, build cache) with reclaimable size. |
+| `portainer_docker_prune(target, all_images?, endpoint_id?)` | Reclaim disk: `target` is `containers` (stopped), `images` (dangling only, or all unused with `all_images=true`) or `build_cache`. Volumes are never pruned. Audit-logged. |
 
 ### Users
 
@@ -335,7 +341,7 @@ The agent will call `portainer_containers_list()` to find the container, then `p
 **Roll out a new build on Swarm:**
 > "Deploy the latest arena-etl image"
 
-The agent will call `portainer_stack_update(stack_id, pull_image=true)` — the stack's Env variables are preserved — or `portainer_service_update(service_id, image="registry/app:latest")` for a single service, then `portainer_stack_status("arena-etl")` to confirm every service reports running == desired.
+The agent will call `portainer_stack_update(stack_id, pull_image=true)` — the stack's Env variables are preserved — or `portainer_service_update(service_id, image="registry/app:latest")` for a single service, then `portainer_stack_wait("arena-etl")` to confirm the rollout converged (and `portainer_service_rollback` if it did not).
 
 **Update an existing stack:**
 > "Update the arena-etl stack to use the new image tag v2.1"
@@ -361,6 +367,7 @@ The agent will call `portainer_service_tasks("arena-etl_worker")` and read the t
 - **No hardcoded credentials** — all secrets come from environment variables. Optional `X-Registry-Auth` for private-registry image pulls is passed in via parameter, never persisted.
 - **Container removal** — `force` defaults to `false` to prevent accidental deletion of running containers.
 - **Log/exec size limits** — output is capped at 100K characters to prevent memory exhaustion.
+- **Non-JSON responses are surfaced, not swallowed** — a reverse proxy's HTML login page in place of the API is reported as "Unexpected response from Portainer" with the content type and the first bytes of the body.
 
 ---
 
@@ -381,7 +388,7 @@ export PORTAINER_PASSWORD=your-password
 python3 -m portainer_mcp.server
 ```
 
-Lint, type-check and test:
+Lint, type-check and test (CI runs the same on Python 3.10–3.13 for every push and pull request):
 
 ```bash
 ruff check src/ tests/

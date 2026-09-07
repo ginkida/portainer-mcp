@@ -13,6 +13,16 @@ logger = logging.getLogger(__name__)
 
 P = ParamSpec("P")
 
+
+class PortainerResponseError(RuntimeError):
+    """Portainer answered 2xx with a body that is not JSON.
+
+    The realistic trigger is a reverse proxy or SSO gateway in front of
+    Portainer answering with an HTML login/error page: the HTTP status says
+    "fine", the body says nothing usable. Surfaced as its own envelope so the
+    user sees *what* came back instead of a generic "Internal error".
+    """
+
 # Redacts the most common secret shapes from audit-log previews so credentials
 # passed inside an exec command / tinker snippet never land in stderr logs.
 # Covered shapes: Authorization headers, bare bearer tokens, KEY=value /
@@ -185,7 +195,11 @@ def redact_compose_text(text: str) -> str:
         line = _URL_CREDS_RE.sub(f"://{REDACTED}@", line)
         m = _ENV_LINE_RE.match(line)
         if m is None:
-            lines[idx] = _SECRET_RE.sub(REDACTED, line)
+            # _SECRET_RE needs a `=`/`:` after the keyword; skipping lines
+            # without one keeps a 500 K file of keyword runs linear.
+            if "=" in line or ":" in line:
+                line = _SECRET_RE.sub(REDACTED, line)
+            lines[idx] = line
             continue
         prefix, name, sep, value = m.group("prefix", "name", "sep", "value")
         if is_sensitive_env_name(name) and _BLOCK_SCALAR_RE.match(value.strip()):
@@ -284,6 +298,8 @@ def tool_error_handler(func: Callable[P, Awaitable[str]]) -> Callable[P, Awaitab
             return error_response(
                 f"Portainer API error ({status})", redact_secrets(detail)
             )
+        except PortainerResponseError as exc:
+            return error_response("Unexpected response from Portainer", redact_secrets(str(exc)))
         except httpx.TransportError as exc:
             # Covers connect/read/write/protocol/proxy errors and timeouts —
             # any of them means "couldn't complete the HTTP exchange", which

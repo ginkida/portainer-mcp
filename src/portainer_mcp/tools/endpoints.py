@@ -26,7 +26,7 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         endpoints = await client.get("/api/endpoints")
         result = []
-        for ep in endpoints:
+        for ep in endpoints or []:
             result.append({
                 "id": ep["Id"],
                 "name": ep["Name"],

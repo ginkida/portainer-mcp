@@ -33,13 +33,13 @@ async def test_lifespan_closes_client_when_body_raises() -> None:
     assert client_mod._client is None
 
 
-async def test_all_47_tools_registered() -> None:
+async def test_all_53_tools_registered() -> None:
     # Keep the registered surface in sync with the documented tool count
     # (pyproject description / README). Uses the public list_tools() API.
     # Build explicitly: the module-level `mcp` reads the Laravel flag from the
     # ambient environment at import time, before conftest's per-test delenv.
     tools = await create_server(enable_laravel_tools=False).list_tools()
-    assert len(tools) == 47
+    assert len(tools) == 53
     assert all(t.name.startswith("portainer_") for t in tools)
     names = {t.name for t in tools}
     assert "portainer_laravel_tinker" not in names
@@ -48,7 +48,7 @@ async def test_all_47_tools_registered() -> None:
 
 async def test_laravel_flag_adds_two_tools() -> None:
     tools = await create_server(enable_laravel_tools=True).list_tools()
-    assert len(tools) == 49
+    assert len(tools) == 55
     names = {t.name for t in tools}
     assert {"portainer_laravel_tinker", "portainer_laravel_errors"} <= names
 

@@ -186,9 +186,7 @@ async def test_handler_http_error_list_body() -> None:
 
 
 async def test_handler_http_error_non_json_body_truncated() -> None:
-    body = json.loads(
-        await _raising_tool(_http_error(502, content=b"<html>" + b"x" * 1000))()
-    )
+    body = json.loads(await _raising_tool(_http_error(502, content=b"<html>" + b"x" * 1000))())
     assert body["error"] == "Portainer API error (502)"
     assert len(body["details"]) <= 500
 
@@ -217,9 +215,20 @@ async def test_handler_unexpected_error_is_redacted() -> None:
 @pytest.mark.parametrize(
     "name",
     [
-        "CLICKHOUSE_PASSWORD", "DB_PASS", "APP_KEY", "API_KEY", "ApiKey", "JWT_SECRET",
-        "AUTH_TOKEN", "AWS_SECRET_ACCESS_KEY", "PRIVATE_KEY", "MAIL_PWD", "DATABASE_DSN",
-        "SIGNATURE", "REDIS_AUTH", "SESSION_SALT",
+        "CLICKHOUSE_PASSWORD",
+        "DB_PASS",
+        "APP_KEY",
+        "API_KEY",
+        "ApiKey",
+        "JWT_SECRET",
+        "AUTH_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "PRIVATE_KEY",
+        "MAIL_PWD",
+        "DATABASE_DSN",
+        "SIGNATURE",
+        "REDIS_AUTH",
+        "SESSION_SALT",
     ],
 )
 def test_sensitive_env_names(name: str) -> None:
@@ -252,10 +261,16 @@ def test_redact_env_value_rules() -> None:
 def test_redact_env_pairs_and_strings_keep_shape() -> None:
     pairs = [{"name": "TOKEN", "value": "t"}, {"name": "PORT", "value": "80"}, "junk", {"x": 1}]
     assert redact_env_pairs(pairs) == [
-        {"name": "TOKEN", "value": REDACTED}, {"name": "PORT", "value": "80"}, "junk", {"x": 1},
+        {"name": "TOKEN", "value": REDACTED},
+        {"name": "PORT", "value": "80"},
+        "junk",
+        {"x": 1},
     ]
     assert redact_env_strings(["TOKEN=t", "PORT=80", "NOEQ", 5]) == [
-        f"TOKEN={REDACTED}", "PORT=80", "NOEQ", 5,
+        f"TOKEN={REDACTED}",
+        "PORT=80",
+        "NOEQ",
+        5,
     ]
 
 
@@ -296,8 +311,8 @@ def test_redact_compose_text_is_linear_on_long_lines() -> None:
 
 
 def test_redact_compose_text_keeps_quoted_list_items_balanced() -> None:
-    out = redact_compose_text('      - "DB_PASSWORD=x"\n      - \'TOKEN=y\'\n')
-    assert out == f'      - "DB_PASSWORD={REDACTED}"\n      - \'TOKEN={REDACTED}\'\n'
+    out = redact_compose_text("      - \"DB_PASSWORD=x\"\n      - 'TOKEN=y'\n")
+    assert out == f"      - \"DB_PASSWORD={REDACTED}\"\n      - 'TOKEN={REDACTED}'\n"
 
 
 @pytest.mark.parametrize(
@@ -323,3 +338,11 @@ def test_redact_compose_text_extra_shapes(text: str, leak: str, keep: str | None
 def test_redact_compose_text_keeps_quoted_reference() -> None:
     line = '  DB_PASSWORD: "${DB_PASSWORD}"\n'
     assert redact_compose_text(line) == line
+
+
+async def test_handler_maps_non_json_response_error() -> None:
+    from portainer_mcp.errors import PortainerResponseError
+
+    body = json.loads(await _raising_tool(PortainerResponseError("html page token=SECRET"))())
+    assert body["error"] == "Unexpected response from Portainer"
+    assert "SECRET" not in body["details"] and "html page" in body["details"]
