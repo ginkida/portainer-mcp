@@ -12,6 +12,20 @@ from ..errors import resolve_endpoint, tool_error_handler
 
 logger = logging.getLogger(__name__)
 
+def swarm_flags(info: Any) -> tuple[bool, bool]:
+    """``(joined, manager)`` from a Docker ``/info`` payload.
+
+    The one Swarm-detection idiom for the whole tool set: ``joined`` is
+    ``Swarm.LocalNodeState == "active"`` (true on workers too), ``manager``
+    additionally requires ``ControlAvailable`` — the only state in which the
+    service/task/node tools and the Swarm stack path actually work.
+    """
+    swarm = (info or {}).get("Swarm") if isinstance(info, dict) else None
+    swarm = swarm if isinstance(swarm, dict) else {}
+    joined = swarm.get("LocalNodeState") == "active"
+    return joined, joined and bool(swarm.get("ControlAvailable"))
+
+
 # What portainer_docker_prune may clean. Volumes are deliberately absent:
 # pruning them destroys data, which no "free some disk" request should do
 # implicitly — remove a volume by name with portainer_volume_remove instead.
@@ -36,6 +50,7 @@ def register(mcp: FastMCP) -> None:
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         info = await client.get(f"/api/endpoints/{eid}/docker/info") or {}
+        swarm_joined, swarm_manager = swarm_flags(info)
         return json.dumps({
             "name": info.get("Name"),
             "os": info.get("OperatingSystem"),
@@ -50,7 +65,8 @@ def register(mcp: FastMCP) -> None:
             "containers_stopped": info.get("ContainersStopped"),
             "images": info.get("Images"),
             "storage_driver": info.get("Driver"),
-            "swarm_active": info.get("Swarm", {}).get("LocalNodeState") == "active",
+            "swarm_active": swarm_joined,
+            "swarm_manager": swarm_manager,
         }, indent=2, ensure_ascii=False)
 
     @mcp.tool()

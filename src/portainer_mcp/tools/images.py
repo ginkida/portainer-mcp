@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from mcp.server.fastmcp import FastMCP
 
@@ -18,7 +18,10 @@ logger = logging.getLogger(__name__)
 # Optional digest suffix (e.g. @sha256:...). Allows any algo:hex pair commonly
 # used by OCI (sha256, sha512). The hash must be at least 32 hex chars.
 _IMAGE_REF_RE = re.compile(
-    r"^[a-zA-Z0-9]([a-zA-Z0-9_.\-/]*[a-zA-Z0-9])?"
+    # optional registry host with port (`reg.local:5000/`) …
+    r"^(?:[a-zA-Z0-9][a-zA-Z0-9.\-]{0,253}(?::[0-9]{1,5})?/)?"
+    # … repository path, optional tag, optional digest
+    r"[a-zA-Z0-9]([a-zA-Z0-9_.\-/]*[a-zA-Z0-9])?"
     r"(:[a-zA-Z0-9_.\-]+)?"
     r"(@[a-z0-9]+:[a-fA-F0-9]{32,})?$"
 )
@@ -38,59 +41,124 @@ def _validate_image_ref(ref: str) -> None:
         )
 
 
-# Hosts that mean "Docker Hub" — never matched against Portainer registries
-# (a Hub registry entry in Portainer would only add credentials for pulls
-# that work anonymously anyway, and most Hub pulls are of public images).
-_DOCKER_HUB_HOSTS = frozenset({"docker.io", "index.docker.io", "registry-1.docker.io"})
+# Every spelling of Docker Hub collapses to the canonical host, so a private
+# Hub repository can match a DockerHub registry configured in Portainer
+# (Portainer stores those with URL "docker.io").
+_DOCKER_HUB = "docker.io"
+_DOCKER_HUB_HOSTS = frozenset({_DOCKER_HUB, "index.docker.io", "registry-1.docker.io"})
+# Portainer registry type for Docker Hub (portainer.RegistryType).
+_DOCKERHUB_REGISTRY_TYPE = 6
+# registry_id=0 is the explicit "anonymous, ignore any stored credentials"
+# switch — validate_id would otherwise reject 0 and there would be no way
+# to opt out of auto-matching (a rotated stored token breaks public pulls).
+ANONYMOUS_REGISTRY = 0
 
 
-def image_registry_host(image: str) -> str | None:
-    """Registry host of an image reference, or ``None`` for Docker Hub.
+def image_registry_host(image: str) -> str:
+    """Registry host of an image reference (``docker.io`` for Docker Hub).
 
     Docker's rule: the first path component is a registry only if it
     contains a ``.`` or ``:`` or is ``localhost``; otherwise it is a Hub
     namespace (``library/nginx``, ``ginkida/app``).
     """
     first, sep, _ = image.partition("/")
-    if not sep:
-        return None
-    if "." not in first and ":" not in first and first != "localhost":
-        return None
-    return None if first.lower() in _DOCKER_HUB_HOSTS else first.lower()
+    if not sep or ("." not in first and ":" not in first and first != "localhost"):
+        return _DOCKER_HUB
+    host = first.lower()
+    return _DOCKER_HUB if host in _DOCKER_HUB_HOSTS else host
 
 
 def _registry_host(url: Any) -> str:
-    """Normalise Portainer's Registry.URL (may carry a scheme or a path)."""
-    if not isinstance(url, str):
+    """Normalise Portainer's Registry.URL to ``host[:port]``.
+
+    Portainer's URL field is free text: it may carry a scheme, userinfo, a
+    path (``/v2/``) or a default port — none of which appear in an image
+    reference. ``urlsplit`` needs a scheme to parse the authority.
+    """
+    if not isinstance(url, str) or not url.strip():
         return ""
-    host = url.strip().lower()
-    if "://" in host:
-        host = host.split("://", 1)[1]
-    return host.split("/", 1)[0]
+    raw = url.strip()
+    parts = urlsplit(raw if "://" in raw else f"//{raw}")
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if not host:
+        return ""
+    if port is None or port in (80, 443):
+        return host
+    return f"{host}:{port}"
 
 
-async def match_registry_id(client: PortainerClient, image: str) -> int | None:
-    """Portainer registry whose URL matches the image's host, if any.
+async def match_registry_id(client: PortainerClient, image: str) -> tuple[int | None, str]:
+    """``(registry_id, credentials label)`` for an image, from Portainer's registries.
 
     Lets pulls and service updates of private images use the credentials
     stored in Portainer without the caller having to know the registry id.
     Tolerant: a failed registry listing (non-admin user, proxy hiccup) just
-    means "no match" — the Docker call then proceeds as an anonymous pull.
+    means "no match" — the Docker call then proceeds anonymously. More than
+    one registry on the same host (GitLab: one per project) raises — the
+    wrong stored token would fail the pull while looking authorised.
     """
     host = image_registry_host(image)
-    if host is None:
-        return None
     try:
         registries = await client.get("/api/registries")
     except Exception as exc:
         logger.debug("Registry listing failed while matching %s: %s", image, exc)
-        return None
+        return None, "none (registry listing failed)"
+    matches: list[int] = []
     for reg in registries or []:
-        if isinstance(reg, dict) and _registry_host(reg.get("URL")) == host:
-            rid = reg.get("Id")
-            if isinstance(rid, int) and not isinstance(rid, bool) and rid > 0:
-                return rid
-    return None
+        if not isinstance(reg, dict):
+            continue
+        rid = reg.get("Id")
+        if not isinstance(rid, int) or isinstance(rid, bool) or rid <= 0:
+            continue
+        reg_host = _registry_host(reg.get("URL"))
+        if host == _DOCKER_HUB:
+            hub_type = reg.get("Type") == _DOCKERHUB_REGISTRY_TYPE
+            if hub_type or reg_host in _DOCKER_HUB_HOSTS:
+                matches.append(rid)
+        elif reg_host == host:
+            matches.append(rid)
+    if not matches:
+        return None, "none"
+    if len(matches) > 1:
+        raise ValueError(
+            f"{len(matches)} Portainer registries match {host!r} (ids {matches}); "
+            f"pass registry_id explicitly, or registry_id={ANONYMOUS_REGISTRY} to pull anonymously."
+        )
+    return matches[0], "portainer (auto)"
+
+
+async def registry_auth_headers(
+    client: PortainerClient,
+    image: str,
+    registry_id: int | None,
+    registry_auth: str | None = None,
+) -> tuple[dict[str, str], int | None, str]:
+    """The one credential-selection path for pulls and service updates.
+
+    Returns ``(headers, registry_id, credentials)`` where ``credentials``
+    says how they were chosen: ``portainer`` (explicit id), ``portainer
+    (auto)`` (matched by host), ``explicit`` (raw X-Registry-Auth),
+    ``anonymous (forced)`` (``registry_id=0``) or ``none``.
+    """
+    if registry_id is not None and registry_auth is not None:
+        raise ValueError("Pass either registry_id or registry_auth, not both")
+    if registry_id == ANONYMOUS_REGISTRY:
+        return {}, None, "anonymous (forced)"
+    if registry_id is not None:
+        validate_id(registry_id, "registry_id")
+        headers = {"X-Registry-Auth": portainer_registry_auth_header(registry_id)}
+        return headers, registry_id, "portainer"
+    if registry_auth is not None:
+        _validate_registry_auth(registry_auth)
+        return {"X-Registry-Auth": registry_auth}, None, "explicit"
+    matched, credentials = await match_registry_id(client, image)
+    if matched is None:
+        return {}, None, credentials
+    return {"X-Registry-Auth": portainer_registry_auth_header(matched)}, matched, credentials
 
 
 def portainer_registry_auth_header(registry_id: int) -> str:
@@ -203,16 +271,18 @@ def register(mcp: FastMCP) -> None:
 
         Credentials for a registry configured in Portainer are supplied by
         Portainer itself: the registry is picked automatically by matching
-        the image's host against portainer_registries_list, or explicitly
-        via registry_id. No password ever passes through the model. Explicit
-        registry_auth is only needed for a registry Portainer does not know.
+        the image's host against portainer_registries_list (Docker Hub
+        images match a DockerHub-type registry), or explicitly via
+        registry_id. registry_id=0 forces an anonymous pull. No password
+        ever passes through the model. Explicit registry_auth is only
+        needed for a registry Portainer does not know.
 
         Args:
             image_name: Image name (e.g. 'nginx', 'ghcr.io/org/app')
             tag: Image tag (default 'latest')
             registry_id: ID of a registry configured in Portainer whose
                 stored credentials should be used (auto-detected from the
-                image host when omitted)
+                image host when omitted; 0 = pull anonymously)
             registry_auth: Base64-encoded JSON
                 ({"username":..,"password":..,"serveraddress":..})
                 forwarded as X-Registry-Auth for a registry not configured
@@ -220,27 +290,12 @@ def register(mcp: FastMCP) -> None:
             endpoint_id: Target endpoint ID (uses default if omitted)
         """
         _validate_image_ref(f"{image_name}:{tag}")
-        if registry_id is not None and registry_auth is not None:
-            raise ValueError("Pass either registry_id or registry_auth, not both")
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
-
-        headers: dict[str, str] = {}
-        credentials = "none"
-        if registry_id is not None:
-            validate_id(registry_id, "registry_id")
-            credentials = "portainer"
-        elif registry_auth is not None:
-            _validate_registry_auth(registry_auth)
-            headers["X-Registry-Auth"] = registry_auth
-            credentials = "explicit"
-        else:
-            registry_id = await match_registry_id(client, image_name)
-            if registry_id is not None:
-                credentials = "portainer (auto)"
-        if registry_id is not None:
-            headers["X-Registry-Auth"] = portainer_registry_auth_header(registry_id)
+        headers, registry_id, credentials = await registry_auth_headers(
+            client, image_name, registry_id, registry_auth
+        )
 
         logger.info(
             "AUDIT: Pulling image %s:%s on endpoint %d (registry_id=%s, credentials=%s)",

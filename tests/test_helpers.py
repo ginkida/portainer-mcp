@@ -380,3 +380,25 @@ def test_redact_env_value_keeps_secret_file_pointers() -> None:
     assert redact_env_pairs([{"name": "TOKEN_FILE", "value": "/run/secrets/t"}]) == [
         {"name": "TOKEN_FILE", "value": "/run/secrets/t"}
     ]
+
+
+def test_env_named_secret_is_still_masked_in_compose() -> None:
+    """The secrets:/configs: exemption is narrow: key + flow sequence only."""
+    text = "environment:\n  - SECRET=hunter2\n  SECRETS: hunter2\n  secrets: [db_pass]\n"
+    out = redact_compose_text(text)
+    assert "hunter2" not in out
+    assert "  secrets: [db_pass]\n" in out
+    block = "  SECRET: |\n    -----BEGIN KEY-----\n    abc\n  next: 1\n"
+    assert "BEGIN" not in redact_compose_text(block)
+
+
+def test_file_suffix_alone_does_not_exempt() -> None:
+    assert redact_env_value("API_KEY_FILE", "ghp_realtoken") == REDACTED
+    assert redact_env_value("PRIVATE_KEY_FILE", "-----BEGIN RSA-----") == REDACTED
+    # A path-shaped value under a *_FILE name is a pointer and stays…
+    assert redact_env_value("API_KEY_FILE", "/etc/app/key.txt") == "/etc/app/key.txt"
+    # …but still goes through the shape pass: URL credentials never survive.
+    url = "https://u:" + "pw@git.example.com/x.yml"
+    assert "pw@" not in redact_env_value("CONFIG_FILE", url)
+    assert redact_env_value("CONFIG_FILE", url).endswith("@git.example.com/x.yml")
+    assert redact_env_value("DB_PASSWORD", "/run/secrets/db") == "/run/secrets/db"

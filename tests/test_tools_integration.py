@@ -85,7 +85,7 @@ async def test_status_connected() -> None:
             "name": "primary",
             "status": 1,
             "swarm": True,
-            "swarm_manager": True,
+            "swarm_role": "manager",
         },
     }
 
@@ -106,7 +106,55 @@ async def test_status_enrichment_failures_do_not_break_connectivity() -> None:
     body = json.loads(_text(await mcp.call_tool("portainer_status", {})))
     assert body["connected"] is True
     assert body["endpoints"] is None
-    assert body["default_endpoint"] == {"id": 1, "name": None, "swarm": None}
+    assert body["default_endpoint"] == {
+        "id": 1,
+        "name": None,
+        "status": None,
+        "swarm": None,
+        "swarm_role": None,
+    }
+
+
+async def test_status_survives_html_enrichment_and_skips_info_when_down() -> None:
+    from portainer_mcp.errors import PortainerResponseError
+
+    mcp = FastMCP("t")
+    auth.register(mcp)
+    client_mod._client = _StatusClient(  # type: ignore[assignment]
+        data=_STATUS, endpoints=PortainerResponseError("html page"), info=ValueError("too big")
+    )
+    body = json.loads(_text(await mcp.call_tool("portainer_status", {})))
+    assert body["connected"] is True and body["endpoints"] is None
+    assert body["default_endpoint"]["swarm"] is None
+
+    class _Down(_StatusClient):
+        def __init__(self) -> None:
+            super().__init__(data=_STATUS, endpoints=[{"Id": 1, "Name": "primary", "Status": 2}])
+            self.paths: list[str] = []
+
+        async def get(self, path: str, **kwargs: Any) -> Any:
+            self.paths.append(path)
+            return await super().get(path, **kwargs)
+
+    down = _Down()
+    client_mod._client = down  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool("portainer_status", {})))
+    assert body["default_endpoint"]["status"] == 2
+    assert body["default_endpoint"]["swarm"] is None
+    assert not any(p.endswith("/docker/info") for p in down.paths)  # no agent round-trip
+
+
+async def test_status_worker_node_is_not_swarm() -> None:
+    mcp = FastMCP("t")
+    auth.register(mcp)
+    client_mod._client = _StatusClient(  # type: ignore[assignment]
+        data=_STATUS,
+        endpoints=[{"Id": 1, "Name": "w"}],
+        info={"Swarm": {"LocalNodeState": "active", "ControlAvailable": False}},
+    )
+    body = json.loads(_text(await mcp.call_tool("portainer_status", {})))
+    assert body["default_endpoint"]["swarm"] is False
+    assert body["default_endpoint"]["swarm_role"] == "worker"
 
 
 async def test_status_reports_api_key_auth_and_standalone(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -123,6 +171,7 @@ async def test_status_reports_api_key_auth_and_standalone(monkeypatch: pytest.Mo
     assert body["auth"] == "api_key"
     assert body["endpoints"] == 0
     assert body["default_endpoint"]["swarm"] is False
+    assert body["default_endpoint"]["swarm_role"] is None
 
 
 async def test_status_unreachable_reports_disconnected_and_redacts() -> None:
@@ -386,6 +435,10 @@ class _PullClient:
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
         self.params: dict[str, Any] | None = None
+
+    async def get(self, path: str, **kwargs: Any) -> Any:
+        assert path == "/api/registries"
+        return []
 
     async def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         self.params = kwargs.get("params")
@@ -1552,18 +1605,18 @@ async def test_logs_grep_matches_only_first_8k_of_a_line() -> None:
 @pytest.mark.parametrize(
     ("image", "host"),
     [
-        ("nginx", None),
-        ("library/nginx", None),
-        ("ginkida/app", None),
-        ("docker.io/library/nginx", None),
-        ("index.docker.io/ginkida/app", None),
+        ("nginx", "docker.io"),
+        ("library/nginx", "docker.io"),
+        ("ginkida/app", "docker.io"),
+        ("docker.io/library/nginx", "docker.io"),
+        ("index.docker.io/ginkida/app", "docker.io"),
         ("reg.ginkida.dev/analytics/analytic", "reg.ginkida.dev"),
         ("REG.Example.COM:5000/app", "reg.example.com:5000"),
         ("localhost/app", "localhost"),
         ("ghcr.io/org/app:v1", "ghcr.io"),
     ],
 )
-def test_image_registry_host(image: str, host: str | None) -> None:
+def test_image_registry_host(image: str, host: str) -> None:
     assert images.image_registry_host(image) == host
 
 
@@ -1608,16 +1661,80 @@ async def test_image_pull_auto_matches_portainer_registry() -> None:
     assert body["registry_id"] == 7
 
 
-async def test_image_pull_skips_registry_lookup_for_docker_hub() -> None:
+async def test_image_pull_docker_hub_matches_only_hub_type_registry() -> None:
     mcp = FastMCP("t")
     images.register(mcp)
-    fake = _RegistryPullClient(_REGISTRIES)
+    fake = _RegistryPullClient(_REGISTRIES)  # no DockerHub-type registry configured
     client_mod._client = fake  # type: ignore[assignment]
     for name in ("nginx", "ginkida/app", "docker.io/library/nginx"):
         body = json.loads(_text(await mcp.call_tool("portainer_image_pull", {"image_name": name})))
         assert body["registry_id"] is None and body["credentials"] == "none", name
         assert fake.headers == {}
-    assert fake.registry_calls == 0
+    # A DockerHub-type registry (Type 6, URL docker.io) does match a private Hub repo.
+    hub = _RegistryPullClient([*_REGISTRIES, {"Id": 11, "URL": "docker.io", "Type": 6}])
+    client_mod._client = hub  # type: ignore[assignment]
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_image_pull", {"image_name": "ginkida/private"}))
+    )
+    assert body["registry_id"] == 11 and body["credentials"] == "portainer (auto)"
+
+
+async def test_image_pull_ambiguous_registries_require_explicit_id() -> None:
+    mcp = FastMCP("t")
+    images.register(mcp)
+    two = _RegistryPullClient(
+        [
+            {"Id": 3, "URL": "registry.gitlab.com", "Type": 4},
+            {"Id": 5, "URL": "https://registry.gitlab.com/", "Type": 4},
+        ]
+    )
+    client_mod._client = two  # type: ignore[assignment]
+    body = json.loads(
+        _text(
+            await mcp.call_tool("portainer_image_pull", {"image_name": "registry.gitlab.com/g/app"})
+        )
+    )
+    assert body["error"] == "Validation error"
+    assert "ids [3, 5]" in body["details"] and "registry_id=0" in body["details"]
+    assert two.headers is None  # nothing was pulled
+    # registry_id=0 is the explicit anonymous switch.
+    body = json.loads(
+        _text(
+            await mcp.call_tool(
+                "portainer_image_pull",
+                {"image_name": "registry.gitlab.com/g/app", "registry_id": 0},
+            )
+        )
+    )
+    assert body["status"] == "pulled"
+    assert body["registry_id"] is None and body["credentials"] == "anonymous (forced)"
+    assert two.headers == {}
+
+
+@pytest.mark.parametrize(
+    ("url", "host"),
+    [
+        ("reg.example.com", "reg.example.com"),
+        ("https://reg.example.com:443", "reg.example.com"),
+        ("http://reg.example.com:80/", "reg.example.com"),
+        ("https://user:pw@reg.local/v2/", "reg.local"),
+        ("REG.Local:5000", "reg.local:5000"),
+        ("https://reg.local:5000/v2/", "reg.local:5000"),
+        ("", ""),
+        (None, ""),
+        ("https://reg.local:notaport/", "reg.local"),
+    ],
+)
+def test_registry_host_normalisation(url: Any, host: str) -> None:
+    assert images._registry_host(url) == host
+
+
+@pytest.mark.parametrize(
+    "ref",
+    ["reg.local:5000/app", "reg.local:5000/org/app:v1", "localhost:5000/app@sha256:" + "a" * 64],
+)
+def test_image_ref_accepts_registry_port(ref: str) -> None:
+    images._validate_image_ref(ref)
 
 
 async def test_image_pull_explicit_registry_id_and_failed_lookup() -> None:
@@ -1641,4 +1758,5 @@ async def test_image_pull_explicit_registry_id_and_failed_lookup() -> None:
         _text(await mcp.call_tool("portainer_image_pull", {"image_name": "reg.ginkida.dev/x/app"}))
     )
     assert body["status"] == "pulled" and body["registry_id"] is None
+    assert body["credentials"] == "none (registry listing failed)"
     assert broken.headers == {}

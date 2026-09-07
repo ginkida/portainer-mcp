@@ -426,7 +426,7 @@ async def test_service_update_force_only_keeps_pinned_digest() -> None:
         ({}, "Nothing to do"),
         ({"replicas": -1}, "replicas"),
         ({"image": "../evil"}, "image reference"),
-        ({"force_restart": True, "registry_id": 0}, "registry_id"),
+        ({"force_restart": True, "registry_id": -1}, "registry_id"),
     ],
 )
 async def test_service_update_validation(args: dict[str, Any], needle: str) -> None:
@@ -1009,21 +1009,42 @@ async def test_service_update_auto_matches_registry_for_private_image() -> None:
             )
         )
     )
-    assert body["registry_id"] == 3
+    assert body["registry_id"] == 3 and body["credentials"] == "portainer (auto)"
     assert fake.update is not None
     assert json.loads(base64.b64decode(fake.update["headers"]["X-Registry-Auth"])) == {
         "registryId": 3
     }
-    # Docker Hub image: no lookup, no header. Force-only: no image, no lookup.
-    for args in ({"image": "nginx:1.25"}, {"force_restart": True}):
-        fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
-        body = json.loads(
-            _text(
-                await _mcp(fake).call_tool(
-                    "portainer_service_update", {"service_id": "svc-a-id", **args}
-                )
+    # Docker Hub image with no Hub-type registry: lookup, no match, no header.
+    fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
+    body = json.loads(
+        _text(
+            await _mcp(fake).call_tool(
+                "portainer_service_update", {"service_id": "svc-a-id", "image": "nginx:1.25"}
             )
         )
-        assert body["registry_id"] is None
-        assert fake.update is not None and fake.update["headers"] == {}
-        assert not any(p == "/api/registries" for p, _ in fake.gets)
+    )
+    assert body["registry_id"] is None and body["credentials"] == "none"
+    assert fake.update is not None and fake.update["headers"] == {}
+    # Force-only: no image, no lookup at all.
+    fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
+    body = json.loads(
+        _text(
+            await _mcp(fake).call_tool(
+                "portainer_service_update", {"service_id": "svc-a-id", "force_restart": True}
+            )
+        )
+    )
+    assert body["registry_id"] is None and body["credentials"] == "none"
+    assert not any(p == "/api/registries" for p, _ in fake.gets)
+    # registry_id=0 forces anonymous even for a matching private host.
+    fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
+    body = json.loads(
+        _text(
+            await _mcp(fake).call_tool(
+                "portainer_service_update",
+                {"service_id": "svc-a-id", "image": "reg.local/app:v3", "registry_id": 0},
+            )
+        )
+    )
+    assert body["credentials"] == "anonymous (forced)"
+    assert fake.update is not None and fake.update["headers"] == {}

@@ -9,9 +9,16 @@ from mcp.server.fastmcp import FastMCP
 
 from ..client import get_client
 from ..config import get_config
-from ..errors import redact_secrets, tool_error_handler
+from ..errors import PortainerResponseError, redact_secrets, tool_error_handler
+from .system import swarm_flags
 
 logger = logging.getLogger(__name__)
+
+# Enrichment calls may fail in every way client.get can fail — transport,
+# HTTP status, a proxy's HTML page (PortainerResponseError), the response-size
+# guard (ValueError) — and none of them says anything about connectivity.
+_ENRICHMENT_ERRORS = (httpx.HTTPError, PortainerResponseError, ValueError)
+_ENDPOINT_DOWN = 2
 
 
 def register(mcp: FastMCP) -> None:
@@ -41,28 +48,41 @@ def register(mcp: FastMCP) -> None:
             }, indent=2, ensure_ascii=False)
         status = status or {}
         # Everything below is enrichment: a failure there must not turn a
-        # reachable Portainer into "connected: false". Each piece degrades to
-        # null independently.
+        # reachable Portainer into "connected: false". Every key is present
+        # on every path (null when unknown) so callers can branch safely.
         endpoints: Any = None
+        default: dict[str, Any] = {
+            "id": config.default_endpoint,
+            "name": None,
+            "status": None,
+            "swarm": None,
+            "swarm_role": None,
+        }
         try:
-            endpoints = await client.get("/api/endpoints")
-        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            # excludeSnapshots: the listing is only used for count/name/status,
+            # not the multi-KB snapshot each endpoint carries.
+            endpoints = await client.get("/api/endpoints", params={"excludeSnapshots": "true"})
+        except _ENRICHMENT_ERRORS as exc:
             logger.debug("status: endpoint listing failed: %s", exc)
         endpoint_list = [e for e in (endpoints or []) if isinstance(e, dict)]
-        default: dict[str, Any] = {"id": config.default_endpoint, "name": None, "swarm": None}
         for ep in endpoint_list:
             if ep.get("Id") == config.default_endpoint:
                 default["name"] = ep.get("Name")
                 default["status"] = ep.get("Status")  # 1 = up, 2 = down
                 break
-        try:
-            info = await client.get(f"/api/endpoints/{config.default_endpoint}/docker/info")
-        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-            logger.debug("status: docker info for default endpoint failed: %s", exc)
-        else:
-            swarm = (info or {}).get("Swarm") or {}
-            default["swarm"] = swarm.get("LocalNodeState") == "active"
-            default["swarm_manager"] = bool(swarm.get("ControlAvailable"))
+        if default["status"] != _ENDPOINT_DOWN:
+            # Skip the agent round-trip when Portainer already says the
+            # endpoint is down — it would only burn the full timeout.
+            try:
+                info = await client.get(f"/api/endpoints/{config.default_endpoint}/docker/info")
+            except _ENRICHMENT_ERRORS as exc:
+                logger.debug("status: docker info for default endpoint failed: %s", exc)
+            else:
+                joined, manager = swarm_flags(info)
+                # `swarm` answers "will the service/stack tools work here?" —
+                # that is the manager question; a worker says false.
+                default["swarm"] = manager
+                default["swarm_role"] = "manager" if manager else "worker" if joined else None
         return json.dumps(
             {
                 "connected": True,

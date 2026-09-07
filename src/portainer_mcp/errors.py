@@ -112,15 +112,19 @@ _ENV_LINE_RE = re.compile(
 # YAML block scalar indicator (`KEY: |`, `KEY: >-`): the value lives on the
 # following, deeper-indented lines.
 _BLOCK_SCALAR_RE = re.compile(r"^[|>][-+]?\d?$")
-# Compose keys whose values are *names of* secrets/configs, not secrets:
-# `secrets: [db_pass]`, `configs:`, `- source: db_pass`, `external: true`.
-# They match the name heuristic ("secret") but masking them destroys the
-# document structure while hiding nothing.
-_COMPOSE_STRUCTURAL_KEYS = frozenset({
-    "secrets", "configs", "secret", "config", "source", "target", "external", "name", "file",
-})
-# Values that point at a secret rather than contain one.
+# Compose short-syntax secret/config references: `secrets: [db_pass, api_key]`.
+# The key matches the name heuristic ("secret") but the value is a list of
+# secret *names*; masking it wrecks the file while hiding nothing. The
+# exemption is deliberately narrow — key AND a flow-sequence value — so an
+# environment variable that happens to be called SECRET / SECRETS is still
+# masked (`SECRETS: hunter2` is not a list).
+_COMPOSE_REFERENCE_KEYS = frozenset({"secrets", "configs"})
+_FLOW_SEQUENCE_RE = re.compile(r"^\[[^\]]{0,4096}\]$")
+# Values that point at a secret rather than contain one: a mounted secret
+# (`/run/secrets/db`) or, for a `*_FILE` variable, any path-shaped value
+# (no spaces, no `=`; starts with `/`, `./` or `../`).
 _SECRET_MOUNT_PREFIX = "/run/secrets/"
+_PATH_VALUE_RE = re.compile(r"^(?:\.{0,2}/)[^\s=]{0,4096}$")
 
 
 def is_sensitive_env_name(name: str) -> bool:
@@ -140,20 +144,34 @@ def _is_reference(value: str) -> bool:
 
 def _points_at_secret(name: str, value: str) -> bool:
     """``DB_PASSWORD_FILE=/run/secrets/db`` names *where* a secret is, and is
-    exactly what a model editing compose needs to see."""
+    exactly what a model editing compose needs to see. The value must look
+    like a path — a ``*_FILE`` name alone proves nothing (``API_KEY_FILE=ghp_…``)."""
+    bare = value.strip().strip("\"'")
+    if bare.startswith(_SECRET_MOUNT_PREFIX):
+        return True
     segments = _NAME_SPLIT_RE.split(name.lower())
-    return segments[-1] == "file" or value.strip().strip("\"'").startswith(_SECRET_MOUNT_PREFIX)
+    return segments[-1] == "file" and bool(_PATH_VALUE_RE.match(bare))
+
+
+def _redact_shapes(value: str) -> str:
+    value = _URL_CREDS_RE.sub(f"://{REDACTED}@", value)
+    return _SECRET_RE.sub(REDACTED, value)
 
 
 def redact_env_value(name: str, value: str) -> str:
     """Mask ``value`` when ``name`` looks sensitive; otherwise mask only
-    embedded secret shapes (URL credentials, ``--password`` flags, ``k=v``)."""
-    if not value or _is_reference(value) or _points_at_secret(name, value):
+    embedded secret shapes (URL credentials, ``--password`` flags, ``k=v``).
+
+    A sensitive name whose value merely points at a secret (see
+    :func:`_points_at_secret`) keeps the pointer — but still goes through
+    the shape pass, so ``CONFIG_FILE=https://u:pw@host/x`` loses its
+    credentials and only the path survives.
+    """
+    if not value or _is_reference(value):
         return value
-    if is_sensitive_env_name(name):
+    if is_sensitive_env_name(name) and not _points_at_secret(name, value):
         return REDACTED
-    value = _URL_CREDS_RE.sub(f"://{REDACTED}@", value)
-    return _SECRET_RE.sub(REDACTED, value)
+    return _redact_shapes(value)
 
 
 def redact_env_pairs(pairs: list[Any]) -> list[Any]:
@@ -218,9 +236,8 @@ def redact_compose_text(text: str) -> str:
             lines[idx] = line
             continue
         prefix, name, sep, value = m.group("prefix", "name", "sep", "value")
-        if name.lower() in _COMPOSE_STRUCTURAL_KEYS:
-            # `secrets: [a, b]` / `source: db_pass` — references, keep as is
-            # (URL credentials were already masked above).
+        if name.lower() in _COMPOSE_REFERENCE_KEYS and _FLOW_SEQUENCE_RE.match(value.strip()):
+            # `secrets: [a, b]` — a list of secret names, keep as is.
             lines[idx] = line
             continue
         if is_sensitive_env_name(name) and _BLOCK_SCALAR_RE.match(value.strip()):

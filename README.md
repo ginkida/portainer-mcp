@@ -218,7 +218,7 @@ All 53 tools are listed below with their parameters and descriptions (55 with th
 
 | Tool | Description |
 |---|---|
-| `portainer_status()` | Check connection and authentication status. Returns version, instance ID, auth mode, the number of endpoints and whether the default endpoint is a Swarm cluster (manager). |
+| `portainer_status()` | Check connection and authentication status. Returns version, instance ID, auth mode, the number of endpoints and, for the default endpoint, its name/status and `swarm` (true only on a Swarm **manager**, where the service tools work) with `swarm_role`. |
 
 ### Endpoints (Environments)
 
@@ -285,7 +285,7 @@ All 53 tools are listed below with their parameters and descriptions (55 with th
 |---|---|
 | `portainer_images_list(endpoint_id?, reference_filter?)` | List images with tags and sizes. `reference_filter` applies a server-side filter (e.g. `nginx:1.25`). |
 | `portainer_image_inspect(image_id, endpoint_id?)` | Get detailed image info. Accepts `name:tag` or `name@sha256:digest`. |
-| `portainer_image_pull(image_name, tag?, registry_id?, registry_auth?, endpoint_id?)` | Pull an image. `tag` defaults to `"latest"`. For a registry configured in Portainer the stored credentials are supplied by Portainer itself — the registry is matched automatically by the image's host (`reg.example.com/app` → the Portainer registry with that URL), or pass `registry_id` explicitly; no password passes through the model. `registry_auth` (base64 JSON `{"username":..,"password":..,"serveraddress":..}`) is only for registries Portainer doesn't know. The pull-progress stream is parsed and any `errorDetail` is surfaced as a tool error. |
+| `portainer_image_pull(image_name, tag?, registry_id?, registry_auth?, endpoint_id?)` | Pull an image. `tag` defaults to `"latest"`. For a registry configured in Portainer the stored credentials are supplied by Portainer itself — the registry is matched automatically by the image's host (`reg.example.com/app` → the Portainer registry with that URL; Docker Hub images match a DockerHub-type registry), or pass `registry_id` explicitly; `registry_id=0` forces an anonymous pull; several registries on the same host must be disambiguated explicitly. No password passes through the model. The result reports `registry_id` and how `credentials` were chosen. `registry_auth` (base64 JSON `{"username":..,"password":..,"serveraddress":..}`) is only for registries Portainer doesn't know. The pull-progress stream is parsed and any `errorDetail` is surfaced as a tool error. |
 | `portainer_image_remove(image_id, endpoint_id?)` | Remove an image. |
 | `portainer_registries_list()` | Registries configured in Portainer (id, name, URL, type, authentication flag) — the `registry_id` source for pulls and service updates. |
 
@@ -313,7 +313,7 @@ All 53 tools are listed below with their parameters and descriptions (55 with th
 
 | Tool | Description |
 |---|---|
-| `portainer_docker_info(endpoint_id?)` | OS, CPU, memory, container/image counts, swarm state. |
+| `portainer_docker_info(endpoint_id?)` | OS, CPU, memory, container/image counts, `swarm_active` (node joined a Swarm) and `swarm_manager`. |
 | `portainer_docker_disk_usage(endpoint_id?)` | Per-category disk usage (containers, images, volumes, build cache) with reclaimable size. |
 | `portainer_docker_prune(target, all_images?, endpoint_id?)` | Reclaim disk: `target` is `containers` (stopped), `images` (dangling only, or all unused with `all_images=true`) or `build_cache`. Volumes are never pruned. Audit-logged. |
 
