@@ -144,6 +144,45 @@ async def test_status_survives_html_enrichment_and_skips_info_when_down() -> Non
     assert not any(p.endswith("/docker/info") for p in down.paths)  # no agent round-trip
 
 
+async def test_status_unusable_enrichment_bodies_are_unknown() -> None:
+    mcp = FastMCP("t")
+    auth.register(mcp)
+    client_mod._client = _StatusClient(  # type: ignore[assignment]
+        data=_STATUS, endpoints={"message": "forbidden"}, info=None
+    )
+    body = json.loads(_text(await mcp.call_tool("portainer_status", {})))
+    assert body["connected"] is True
+    assert body["endpoints"] is None  # a dict body is not "0 endpoints"
+    assert body["default_endpoint"]["swarm"] is None  # empty info is not "standalone"
+    client_mod._client = _StatusClient(  # type: ignore[assignment]
+        data=_STATUS, endpoints=[{"Id": 1, "Name": "x"}], info={"Name": "no-swarm-key"}
+    )
+    body = json.loads(_text(await mcp.call_tool("portainer_status", {})))
+    assert body["default_endpoint"]["swarm"] is None
+
+
+async def test_status_probes_use_short_timeout() -> None:
+    class _Timing(_StatusClient):
+        def __init__(self) -> None:
+            super().__init__(
+                data=_STATUS, endpoints=[{"Id": 1}], info={"Swarm": {"LocalNodeState": "inactive"}}
+            )
+            self.timeouts: dict[str, Any] = {}
+
+        async def get(self, path: str, **kwargs: Any) -> Any:
+            self.timeouts[path] = kwargs.get("timeout")
+            return await super().get(path, **kwargs)
+
+    mcp = FastMCP("t")
+    auth.register(mcp)
+    fake = _Timing()
+    client_mod._client = fake  # type: ignore[assignment]
+    await mcp.call_tool("portainer_status", {})
+    assert fake.timeouts["/api/status"] is None  # the health check itself: default timeout
+    assert fake.timeouts["/api/endpoints"] == auth._PROBE_TIMEOUT
+    assert fake.timeouts["/api/endpoints/1/docker/info"] == auth._PROBE_TIMEOUT
+
+
 async def test_status_worker_node_is_not_swarm() -> None:
     mcp = FastMCP("t")
     auth.register(mcp)
@@ -437,7 +476,7 @@ class _PullClient:
         self.params: dict[str, Any] | None = None
 
     async def get(self, path: str, **kwargs: Any) -> Any:
-        assert path == "/api/registries"
+        assert path == "/api/endpoints/1/registries"
         return []
 
     async def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -1627,7 +1666,7 @@ class _RegistryPullClient(_PullHeaderClient):
         self.registry_calls = 0
 
     async def get(self, path: str, **kwargs: Any) -> Any:
-        assert path == "/api/registries"
+        assert path == "/api/endpoints/1/registries"  # scoped route, not admin-only
         self.registry_calls += 1
         if isinstance(self.registries, Exception):
             raise self.registries
@@ -1679,7 +1718,10 @@ async def test_image_pull_docker_hub_matches_only_hub_type_registry() -> None:
     assert body["registry_id"] == 11 and body["credentials"] == "portainer (auto)"
 
 
-async def test_image_pull_ambiguous_registries_require_explicit_id() -> None:
+async def test_image_pull_ambiguous_registries_fall_back_to_anonymous() -> None:
+    """Two registries on one host: guessing would fail a private pull while
+    looking authorised, raising would break public pulls — so pull
+    anonymously and say why."""
     mcp = FastMCP("t")
     images.register(mcp)
     two = _RegistryPullClient(
@@ -1694,10 +1736,10 @@ async def test_image_pull_ambiguous_registries_require_explicit_id() -> None:
             await mcp.call_tool("portainer_image_pull", {"image_name": "registry.gitlab.com/g/app"})
         )
     )
-    assert body["error"] == "Validation error"
-    assert "ids [3, 5]" in body["details"] and "registry_id=0" in body["details"]
-    assert two.headers is None  # nothing was pulled
-    # registry_id=0 is the explicit anonymous switch.
+    assert body["status"] == "pulled" and body["registry_id"] is None
+    assert body["credentials"].startswith("none (ambiguous: registries [3, 5]")
+    assert two.headers == {}
+    # registry_id=0 is the explicit anonymous switch, an explicit id resolves it.
     body = json.loads(
         _text(
             await mcp.call_tool(
@@ -1706,9 +1748,49 @@ async def test_image_pull_ambiguous_registries_require_explicit_id() -> None:
             )
         )
     )
-    assert body["status"] == "pulled"
-    assert body["registry_id"] is None and body["credentials"] == "anonymous (forced)"
-    assert two.headers == {}
+    assert body["credentials"] == "anonymous (forced)" and two.headers == {}
+    body = json.loads(
+        _text(
+            await mcp.call_tool(
+                "portainer_image_pull",
+                {"image_name": "registry.gitlab.com/g/app", "registry_id": 5},
+            )
+        )
+    )
+    assert body["registry_id"] == 5 and body["credentials"] == "portainer"
+
+
+async def test_image_pull_failure_reports_credential_context() -> None:
+    mcp = FastMCP("t")
+    images.register(mcp)
+    fake = _RegistryPullClient([{"Id": 5, "URL": "docker.io", "Type": 6}])
+    fake.payload = b'{"errorDetail":{"message":"unauthorized: incorrect username or password"}}\n'
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(_text(await mcp.call_tool("portainer_image_pull", {"image_name": "nginx"})))
+    assert body["error"] == "Image pull failed"
+    assert "unauthorized" in body["details"]
+    assert "registry_id=5" in body["details"] and "credentials=portainer (auto)" in body["details"]
+    assert "registry_id=0" in body["details"]
+
+
+@pytest.mark.parametrize("tag", ["5000/app", "v1@sha256:abc", "", " latest", ".hidden"])
+async def test_image_pull_validates_tag_separately(tag: str) -> None:
+    mcp = FastMCP("t")
+    images.register(mcp)
+    fake = _RegistryPullClient([])
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_image_pull", {"image_name": "reg.local", "tag": tag}))
+    )
+    assert body["error"] == "Validation error"
+    assert "tag" in body["details"]
+    assert fake.headers is None  # nothing was sent
+
+
+def test_image_registry_host_drops_default_ports() -> None:
+    assert images.image_registry_host("reg.local:443/app") == "reg.local"
+    assert images.image_registry_host("reg.local:80/app") == "reg.local"
+    assert images.image_registry_host("reg.local:5000/app") == "reg.local:5000"
 
 
 @pytest.mark.parametrize(

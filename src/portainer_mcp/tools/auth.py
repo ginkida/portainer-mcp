@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 # guard (ValueError) — and none of them says anything about connectivity.
 _ENRICHMENT_ERRORS = (httpx.HTTPError, PortainerResponseError, ValueError)
 _ENDPOINT_DOWN = 2
+# The docker/info probe goes through the agent: an unreachable agent must
+# not make the health check hang for the full request timeout.
+_PROBE_TIMEOUT = 5.0
 
 
 def register(mcp: FastMCP) -> None:
@@ -61,9 +64,13 @@ def register(mcp: FastMCP) -> None:
         try:
             # excludeSnapshots: the listing is only used for count/name/status,
             # not the multi-KB snapshot each endpoint carries.
-            endpoints = await client.get("/api/endpoints", params={"excludeSnapshots": "true"})
+            endpoints = await client.get(
+                "/api/endpoints", params={"excludeSnapshots": "true"}, timeout=_PROBE_TIMEOUT
+            )
         except _ENRICHMENT_ERRORS as exc:
             logger.debug("status: endpoint listing failed: %s", exc)
+        if not isinstance(endpoints, list):
+            endpoints = None  # a non-list 200 body is "unknown", not "zero endpoints"
         endpoint_list = [e for e in (endpoints or []) if isinstance(e, dict)]
         for ep in endpoint_list:
             if ep.get("Id") == config.default_endpoint:
@@ -74,15 +81,22 @@ def register(mcp: FastMCP) -> None:
             # Skip the agent round-trip when Portainer already says the
             # endpoint is down — it would only burn the full timeout.
             try:
-                info = await client.get(f"/api/endpoints/{config.default_endpoint}/docker/info")
+                info = await client.get(
+                    f"/api/endpoints/{config.default_endpoint}/docker/info",
+                    timeout=_PROBE_TIMEOUT,
+                )
             except _ENRICHMENT_ERRORS as exc:
                 logger.debug("status: docker info for default endpoint failed: %s", exc)
             else:
-                joined, manager = swarm_flags(info)
-                # `swarm` answers "will the service/stack tools work here?" —
-                # that is the manager question; a worker says false.
-                default["swarm"] = manager
-                default["swarm_role"] = "manager" if manager else "worker" if joined else None
+                # An empty / Swarm-less body is "unknown", not "standalone":
+                # reporting swarm=false for a manager would steer the agent
+                # away from the service tools.
+                if isinstance(info, dict) and isinstance(info.get("Swarm"), dict):
+                    joined, manager = swarm_flags(info)
+                    # `swarm` answers "will the service/stack tools work
+                    # here?" — the manager question; a worker says false.
+                    default["swarm"] = manager
+                    default["swarm_role"] = "manager" if manager else "worker" if joined else None
         return json.dumps(
             {
                 "connected": True,

@@ -12,7 +12,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..client import PortainerClient, get_client
 from ..config import get_config
-from ..errors import redact_env_strings, resolve_endpoint, tool_error_handler
+from ..errors import redact_env_strings, resolve_endpoint, tool_error_handler, validate_id
 from .containers import (
     _MAX_LOG_CHARS,
     _STACK_NAME_RE,
@@ -20,7 +20,7 @@ from .containers import (
     _log_params,
     _parse_docker_stream,
 )
-from .images import _validate_image_ref, registry_auth_headers
+from .images import ANONYMOUS_REGISTRY, _validate_image_ref, registry_auth_headers
 
 logger = logging.getLogger(__name__)
 
@@ -649,6 +649,9 @@ def register(mcp: FastMCP) -> None:
             not isinstance(replicas, int) or isinstance(replicas, bool) or replicas < 0
         ):
             raise ValueError(f"Invalid replicas: {replicas!r}. Must be a non-negative integer.")
+        if registry_id is not None and registry_id != ANONYMOUS_REGISTRY:
+            validate_id(registry_id, "registry_id")  # before any API call
+
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
@@ -658,10 +661,9 @@ def register(mcp: FastMCP) -> None:
         if image is not None or registry_id is not None:
             # Only an image change needs registry credentials (force/scale
             # keep the digest pinned in the spec); an explicit id is honoured
-            # either way.
-            current = ((spec.get("TaskTemplate") or {}).get("ContainerSpec") or {}).get("Image")
+            # either way (no host matching happens without an image).
             headers, registry_id, credentials = await registry_auth_headers(
-                client, image or str(current or ""), registry_id
+                client, eid, image or "", registry_id
             )
 
         changes: dict[str, Any] = {}

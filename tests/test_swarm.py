@@ -174,7 +174,7 @@ class _SwarmClient:
             return _NODES
         if path.endswith("/docker/containers/json"):
             return self.containers
-        if path == "/api/registries":
+        if path.endswith("/registries"):
             return [{"Id": 3, "Name": "gitlab", "URL": "reg.local", "Authentication": True}]
         raise AssertionError(path)
 
@@ -1035,7 +1035,7 @@ async def test_service_update_auto_matches_registry_for_private_image() -> None:
         )
     )
     assert body["registry_id"] is None and body["credentials"] == "none"
-    assert not any(p == "/api/registries" for p, _ in fake.gets)
+    assert not any(p.endswith("/registries") for p, _ in fake.gets)
     # registry_id=0 forces anonymous even for a matching private host.
     fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
     body = json.loads(

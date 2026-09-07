@@ -25,6 +25,8 @@ _IMAGE_REF_RE = re.compile(
     r"(:[a-zA-Z0-9_.\-]+)?"
     r"(@[a-z0-9]+:[a-fA-F0-9]{32,})?$"
 )
+# A tag on its own (no `/`, no `@`): what `image_pull(tag=)` must look like.
+_IMAGE_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}$")
 # Base64 (standard or URL-safe), with or without padding.
 _REGISTRY_AUTH_RE = re.compile(r"^[A-Za-z0-9+/_\-]+={0,2}$")
 # Cap on the /images/create progress stream we buffer before scanning for
@@ -59,13 +61,20 @@ def image_registry_host(image: str) -> str:
 
     Docker's rule: the first path component is a registry only if it
     contains a ``.`` or ``:`` or is ``localhost``; otherwise it is a Hub
-    namespace (``library/nginx``, ``ginkida/app``).
+    namespace (``library/nginx``, ``ginkida/app``). Default ports are
+    dropped so ``reg.local:443/app`` matches a registry stored as
+    ``https://reg.local``.
     """
     first, sep, _ = image.partition("/")
     if not sep or ("." not in first and ":" not in first and first != "localhost"):
         return _DOCKER_HUB
     host = first.lower()
-    return _DOCKER_HUB if host in _DOCKER_HUB_HOSTS else host
+    if host in _DOCKER_HUB_HOSTS:
+        return _DOCKER_HUB
+    for default_port in (":443", ":80"):
+        if host.endswith(default_port):
+            return host[: -len(default_port)]
+    return host
 
 
 def _registry_host(url: Any) -> str:
@@ -91,21 +100,27 @@ def _registry_host(url: Any) -> str:
     return f"{host}:{port}"
 
 
-async def match_registry_id(client: PortainerClient, image: str) -> tuple[int | None, str]:
+async def match_registry_id(
+    client: PortainerClient, eid: int, image: str
+) -> tuple[int | None, str]:
     """``(registry_id, credentials label)`` for an image, from Portainer's registries.
 
     Lets pulls and service updates of private images use the credentials
     stored in Portainer without the caller having to know the registry id.
-    Tolerant: a failed registry listing (non-admin user, proxy hiccup) just
-    means "no match" — the Docker call then proceeds anonymously. More than
-    one registry on the same host (GitLab: one per project) raises — the
-    wrong stored token would fail the pull while looking authorised.
+    Uses the endpoint-scoped listing (``/api/endpoints/{id}/registries``):
+    the global ``/api/registries`` is admin-only, and the scoped one returns
+    exactly the registries this user may use on this endpoint. Tolerant: a
+    failed listing just means "no match" — the Docker call then proceeds
+    anonymously and the label says why. More than one registry on the same
+    host (GitLab: one per project; two Hub accounts) also means anonymous —
+    guessing would fail a private pull while looking authorised, while a
+    public image must keep working; the label carries the candidate ids.
     """
     host = image_registry_host(image)
     try:
-        registries = await client.get("/api/registries")
+        registries = await client.get(f"/api/endpoints/{eid}/registries")
     except Exception as exc:
-        logger.debug("Registry listing failed while matching %s: %s", image, exc)
+        logger.warning("Registry listing failed while matching %s: %s", image, exc)
         return None, "none (registry listing failed)"
     matches: list[int] = []
     for reg in registries or []:
@@ -124,15 +139,13 @@ async def match_registry_id(client: PortainerClient, image: str) -> tuple[int | 
     if not matches:
         return None, "none"
     if len(matches) > 1:
-        raise ValueError(
-            f"{len(matches)} Portainer registries match {host!r} (ids {matches}); "
-            f"pass registry_id explicitly, or registry_id={ANONYMOUS_REGISTRY} to pull anonymously."
-        )
+        return None, f"none (ambiguous: registries {matches} match {host!r}; pass registry_id)"
     return matches[0], "portainer (auto)"
 
 
 async def registry_auth_headers(
     client: PortainerClient,
+    eid: int,
     image: str,
     registry_id: int | None,
     registry_auth: str | None = None,
@@ -155,10 +168,20 @@ async def registry_auth_headers(
     if registry_auth is not None:
         _validate_registry_auth(registry_auth)
         return {"X-Registry-Auth": registry_auth}, None, "explicit"
-    matched, credentials = await match_registry_id(client, image)
+    matched, credentials = await match_registry_id(client, eid, image)
     if matched is None:
         return {}, None, credentials
     return {"X-Registry-Auth": portainer_registry_auth_header(matched)}, matched, credentials
+
+
+def registry_hint(registry_id: int | None, credentials: str) -> str:
+    """Suffix for pull/update error details: which credentials were used and
+    how to change that — a stale stored token or a denied listing otherwise
+    surfaces as a bare "unauthorized"."""
+    return (
+        f" [registry_id={registry_id}, credentials={credentials}; pass registry_id "
+        f"explicitly or registry_id={ANONYMOUS_REGISTRY} to pull anonymously]"
+    )
 
 
 def portainer_registry_auth_header(registry_id: int) -> str:
@@ -289,12 +312,16 @@ def register(mcp: FastMCP) -> None:
                 in Portainer. Mutually exclusive with registry_id.
             endpoint_id: Target endpoint ID (uses default if omitted)
         """
-        _validate_image_ref(f"{image_name}:{tag}")
+        # Validate the two parts separately: concatenated, a tag containing
+        # "/" re-parses as a registry host:port and slips through.
+        _validate_image_ref(image_name)
+        if not _IMAGE_TAG_RE.match(tag):
+            raise ValueError(f"Invalid tag: {tag!r}. Must match {_IMAGE_TAG_RE.pattern}")
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         headers, registry_id, credentials = await registry_auth_headers(
-            client, image_name, registry_id, registry_auth
+            client, eid, image_name, registry_id, registry_auth
         )
 
         logger.info(
@@ -325,7 +352,7 @@ def register(mcp: FastMCP) -> None:
         if errors:
             return error_response(
                 "Image pull failed",
-                "; ".join(errors[:3]),
+                "; ".join(errors[:3]) + registry_hint(registry_id, credentials),
             )
         return json.dumps({
             "status": "pulled",

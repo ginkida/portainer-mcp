@@ -30,9 +30,10 @@ Portainer MCP: manages Docker endpoints (Swarm clusters and standalone hosts) \
 through Portainer's API. Every tool returns JSON; mutating tools are audit-logged.
 
 How to work:
-- Start with portainer_endpoints_list / portainer_docker_info to learn whether an \
-endpoint is a Swarm cluster (swarm_active). On Swarm, think in services and tasks, \
-not containers: use portainer_stack_status, portainer_services_list, \
+- Start with portainer_status: default_endpoint.swarm is true only on a Swarm \
+manager, where the service tools work (a worker reports swarm_role "worker" — treat \
+it like a standalone host). On a manager, think in services and tasks, not \
+containers: use portainer_stack_status, portainer_services_list, \
 portainer_service_tasks and portainer_service_logs first; containers are transient \
 task instances.
 - Before editing a stack, ALWAYS call portainer_stack_inspect (with reveal_env=true \
@@ -47,8 +48,11 @@ portainer_service_rollback undoes the last update. After any rollout call \
 portainer_stack_wait / portainer_service_wait to confirm it converged instead of \
 polling by hand. Cron-driven services (cron: true) rest at 0 replicas — judge them \
 by last_run_state, not by replicas.
-- Private registries configured in Portainer are used by passing registry_id \
-(see portainer_registries_list); never ask for registry passwords.
+- Registry credentials come from Portainer, never from the user: image_pull and \
+service_update pick the configured registry matching the image host automatically \
+(the result's credentials field says which); pass registry_id explicitly when the \
+label reports an ambiguous host, or registry_id=0 to pull anonymously when a stored \
+token is stale. Never ask for registry passwords.
 """
 
 

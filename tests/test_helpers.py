@@ -402,3 +402,38 @@ def test_file_suffix_alone_does_not_exempt() -> None:
     assert "pw@" not in redact_env_value("CONFIG_FILE", url)
     assert redact_env_value("CONFIG_FILE", url).endswith("@git.example.com/x.yml")
     assert redact_env_value("DB_PASSWORD", "/run/secrets/db") == "/run/secrets/db"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "//user:hunter2@host/x",  # protocol-relative URL: no "://" for the URL rule
+        "/a:hunter2",
+        "/9jX4kQ2mN8pLwZ3vB1cR7tY6uI0oP5a",  # unpadded base64 starting with "/"
+        "/" + "x" * 65,  # one absurd segment
+        "/etc/key+extra",
+    ],
+)
+def test_file_pointer_must_look_like_a_path(value: str) -> None:
+    assert redact_env_value("TOKEN_FILE", value) == REDACTED
+
+
+@pytest.mark.parametrize(
+    "value", ["/etc/app/key.txt", "./key.pem", "../certs/x", "/run/secrets/db"]
+)
+def test_file_pointer_paths_are_kept(value: str) -> None:
+    assert redact_env_value("TOKEN_FILE", value) == value
+
+
+def test_compose_reference_exemption_is_structural() -> None:
+    env = 'environment:\n  SECRETS: ["sk-live-abc"]\n  - SECRETS=[hunter2,hunter3]\n'
+    out = redact_compose_text(env)
+    assert "sk-live" not in out and "hunter" not in out
+    structural = (
+        "  secrets: [\n    db_password,\n    api_key\n  ]\n"
+        "  secrets: {}\n"
+        "  configs: &shared\n"
+        "  x-secret-anchors: &anchors\n"
+        "  password: *anchors\n"
+    )
+    assert redact_compose_text(structural) == structural

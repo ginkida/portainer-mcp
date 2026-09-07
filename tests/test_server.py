@@ -59,3 +59,8 @@ def test_server_instructions_are_set() -> None:
     assert "portainer_stack_inspect" in INSTRUCTIONS
     assert "portainer_services_list" in INSTRUCTIONS
     assert "[REDACTED]" in INSTRUCTIONS
+    # Swarm detection must point at the manager-based answer, and registry
+    # handling at the auto-match + registry_id=0 opt-out (both changed in 0.8.0).
+    assert "default_endpoint.swarm" in INSTRUCTIONS
+    assert "swarm_active" not in INSTRUCTIONS
+    assert "registry_id=0" in INSTRUCTIONS

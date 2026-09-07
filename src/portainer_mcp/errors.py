@@ -115,16 +115,32 @@ _BLOCK_SCALAR_RE = re.compile(r"^[|>][-+]?\d?$")
 # Compose short-syntax secret/config references: `secrets: [db_pass, api_key]`.
 # The key matches the name heuristic ("secret") but the value is a list of
 # secret *names*; masking it wrecks the file while hiding nothing. The
-# exemption is deliberately narrow — key AND a flow-sequence value — so an
-# environment variable that happens to be called SECRET / SECRETS is still
-# masked (`SECRETS: hunter2` is not a list).
+# exemption is deliberately narrow: the exact lowercase compose key (env
+# vars are `SECRETS`, case-sensitive), mapping form (`:` separator, not a
+# `- ` list item) and a value that is a flow collection opener / list of
+# identifiers / YAML anchor — never a quoted string. `SECRETS: ["sk-…"]`
+# under `environment:` therefore stays masked.
 _COMPOSE_REFERENCE_KEYS = frozenset({"secrets", "configs"})
-_FLOW_SEQUENCE_RE = re.compile(r"^\[[^\]]{0,4096}\]$")
+_REFERENCE_VALUE_RE = re.compile(
+    r"^(?:"
+    r"\[[ A-Za-z0-9_.\-,]{0,4096}\]?"  # [a, b] or a multi-line opener "["
+    r"|\{\s{0,16}\}?"  # {} or a multi-line opener "{"
+    r")$"
+)
+# A YAML anchor definition or alias (`&defaults`, `*defaults`) is structure,
+# not a value — masking it breaks every later `*alias`, whatever the key.
+_YAML_ANCHOR_RE = re.compile(r"^[&*][A-Za-z0-9_\-]{1,128}$")
 # Values that point at a secret rather than contain one: a mounted secret
-# (`/run/secrets/db`) or, for a `*_FILE` variable, any path-shaped value
-# (no spaces, no `=`; starts with `/`, `./` or `../`).
+# (`/run/secrets/db`) or, for a `*_FILE` variable, a value that looks like
+# a file path: absolute with at least two path segments (`/etc/app/key`),
+# or relative (`./`, `../`), built only of path-safe characters — no `:`,
+# `@`, `+` — with no segment longer than a plausible file name. A bare
+# base64 token that happens to start with `/` or a protocol-relative URL
+# (`//u:pw@host`) fails these and stays masked.
 _SECRET_MOUNT_PREFIX = "/run/secrets/"
-_PATH_VALUE_RE = re.compile(r"^(?:\.{0,2}/)[^\s=]{0,4096}$")
+_PATH_VALUE_RE = re.compile(
+    r"^(?:\.{1,2}/|/)(?:[A-Za-z0-9_.\-]{1,64}/){0,32}[A-Za-z0-9_.\-]{0,64}$"
+)
 
 
 def is_sensitive_env_name(name: str) -> bool:
@@ -150,7 +166,10 @@ def _points_at_secret(name: str, value: str) -> bool:
     if bare.startswith(_SECRET_MOUNT_PREFIX):
         return True
     segments = _NAME_SPLIT_RE.split(name.lower())
-    return segments[-1] == "file" and bool(_PATH_VALUE_RE.match(bare))
+    if segments[-1] != "file" or not _PATH_VALUE_RE.match(bare):
+        return False
+    # Absolute paths need a directory: "/9jX4kQ…" is a token, "/etc/x" a file.
+    return bare.startswith(".") or bare.count("/") >= 2
 
 
 def _redact_shapes(value: str) -> str:
@@ -236,8 +255,17 @@ def redact_compose_text(text: str) -> str:
             lines[idx] = line
             continue
         prefix, name, sep, value = m.group("prefix", "name", "sep", "value")
-        if name.lower() in _COMPOSE_REFERENCE_KEYS and _FLOW_SEQUENCE_RE.match(value.strip()):
-            # `secrets: [a, b]` — a list of secret names, keep as is.
+        if _YAML_ANCHOR_RE.match(value.strip()):
+            lines[idx] = line
+            continue
+        if (
+            name in _COMPOSE_REFERENCE_KEYS
+            and "-" not in prefix
+            and sep.strip().startswith(":")
+            and _REFERENCE_VALUE_RE.match(value.strip())
+        ):
+            # `secrets: [a, b]` / `secrets: [` / `configs: {}` / `secrets: &x`
+            # — references to secret names, keep as is.
             lines[idx] = line
             continue
         if is_sensitive_env_name(name) and _BLOCK_SCALAR_RE.match(value.strip()):

@@ -49,7 +49,9 @@ def test_invalid_url_rejected(monkeypatch: pytest.MonkeyPatch, url: str) -> None
         Config()
 
 
-@pytest.mark.parametrize("url", ["http://localhost:9000", "http://127.0.0.1", "https://remote.example"])
+@pytest.mark.parametrize(
+    "url", ["http://localhost:9000", "http://127.0.0.1", "https://remote.example"]
+)
 def test_valid_urls_accepted(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
     monkeypatch.setenv("PORTAINER_URL", url)
     assert Config().url == url.rstrip("/")
