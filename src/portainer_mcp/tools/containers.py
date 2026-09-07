@@ -97,10 +97,11 @@ def _parse_since(since: str | None) -> int | None:
             f"Invalid since: {value!r}. A Unix timestamp must be 9-10 digits "
             "(seconds); use ISO-8601 for a date."
         )
-    # Python 3.10's fromisoformat accepts neither a trailing "Z" nor more
-    # than 6 fractional digits (Docker prints 9) — normalise both.
+    # Python 3.10's fromisoformat accepts neither a trailing "Z" nor any
+    # fraction other than exactly 3 or 6 digits (Docker prints 9, humans type
+    # 1) — normalise to "+00:00" and a 6-digit fraction.
     iso = value[:-1] + "+00:00" if value.endswith("Z") else value
-    iso = _ISO_FRACTION_RE.sub(lambda f: f.group(1)[:7], iso)
+    iso = _ISO_FRACTION_RE.sub(lambda f: f.group(1)[:7].ljust(7, "0"), iso)
     try:
         dt = datetime.fromisoformat(iso)
     except ValueError:
