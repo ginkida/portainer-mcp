@@ -350,7 +350,12 @@ async def test_image_pull_success() -> None:
     body = json.loads(
         _text(await mcp.call_tool("portainer_image_pull", {"image_name": "nginx", "tag": "1.25"}))
     )
-    assert body == {"status": "pulled", "image": "nginx:1.25"}
+    assert body == {
+        "status": "pulled",
+        "image": "nginx:1.25",
+        "registry_id": None,
+        "credentials": "none",
+    }
     assert fake.params == {"fromImage": "nginx", "tag": "1.25"}
 
 
@@ -1476,3 +1481,101 @@ async def test_logs_grep_matches_only_first_8k_of_a_line() -> None:
     )
     assert body["matches_found"] == 1
     assert body["lines"] == ["NEEDLE early"]
+
+
+# --- registry auto-match by image host -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("image", "host"),
+    [
+        ("nginx", None),
+        ("library/nginx", None),
+        ("ginkida/app", None),
+        ("docker.io/library/nginx", None),
+        ("index.docker.io/ginkida/app", None),
+        ("reg.ginkida.dev/analytics/analytic", "reg.ginkida.dev"),
+        ("REG.Example.COM:5000/app", "reg.example.com:5000"),
+        ("localhost/app", "localhost"),
+        ("ghcr.io/org/app:v1", "ghcr.io"),
+    ],
+)
+def test_image_registry_host(image: str, host: str | None) -> None:
+    assert images.image_registry_host(image) == host
+
+
+class _RegistryPullClient(_PullHeaderClient):
+    def __init__(self, registries: Any) -> None:
+        super().__init__(b'{"status":"ok"}\n')
+        self.registries = registries
+        self.registry_calls = 0
+
+    async def get(self, path: str, **kwargs: Any) -> Any:
+        assert path == "/api/registries"
+        self.registry_calls += 1
+        if isinstance(self.registries, Exception):
+            raise self.registries
+        return self.registries
+
+
+_REGISTRIES = [
+    {"Id": 7, "Name": "hub-mirror", "URL": "https://mirror.example.com/v2/", "Type": 3},
+    {"Id": 3, "Name": "gitlab", "URL": "reg.ginkida.dev", "Type": 4, "Authentication": True},
+]
+
+
+async def test_image_pull_auto_matches_portainer_registry() -> None:
+    mcp = FastMCP("t")
+    images.register(mcp)
+    fake = _RegistryPullClient(_REGISTRIES)
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_image_pull", {"image_name": "reg.ginkida.dev/x/app"}))
+    )
+    assert body["registry_id"] == 3
+    assert body["credentials"] == "portainer (auto)"
+    import base64
+
+    assert fake.headers is not None
+    assert json.loads(base64.b64decode(fake.headers["X-Registry-Auth"])) == {"registryId": 3}
+    # Scheme and path in Portainer's URL are ignored when matching.
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_image_pull", {"image_name": "mirror.example.com/app"}))
+    )
+    assert body["registry_id"] == 7
+
+
+async def test_image_pull_skips_registry_lookup_for_docker_hub() -> None:
+    mcp = FastMCP("t")
+    images.register(mcp)
+    fake = _RegistryPullClient(_REGISTRIES)
+    client_mod._client = fake  # type: ignore[assignment]
+    for name in ("nginx", "ginkida/app", "docker.io/library/nginx"):
+        body = json.loads(_text(await mcp.call_tool("portainer_image_pull", {"image_name": name})))
+        assert body["registry_id"] is None and body["credentials"] == "none", name
+        assert fake.headers == {}
+    assert fake.registry_calls == 0
+
+
+async def test_image_pull_explicit_registry_id_and_failed_lookup() -> None:
+    mcp = FastMCP("t")
+    images.register(mcp)
+    fake = _RegistryPullClient(_REGISTRIES)
+    client_mod._client = fake  # type: ignore[assignment]
+    body = json.loads(
+        _text(
+            await mcp.call_tool(
+                "portainer_image_pull", {"image_name": "reg.ginkida.dev/x/app", "registry_id": 9}
+            )
+        )
+    )
+    assert body["registry_id"] == 9 and body["credentials"] == "portainer"
+    assert fake.registry_calls == 0  # explicit id: no lookup
+    # A failing registry listing degrades to an anonymous pull, not an error.
+    broken = _RegistryPullClient(httpx.ConnectError("boom"))
+    client_mod._client = broken  # type: ignore[assignment]
+    body = json.loads(
+        _text(await mcp.call_tool("portainer_image_pull", {"image_name": "reg.ginkida.dev/x/app"}))
+    )
+    assert body["status"] == "pulled" and body["registry_id"] is None
+    assert broken.headers == {}

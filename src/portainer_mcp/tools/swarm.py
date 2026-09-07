@@ -20,7 +20,7 @@ from .containers import (
     _log_params,
     _parse_docker_stream,
 )
-from .images import _validate_image_ref, portainer_registry_auth_header
+from .images import _validate_image_ref, match_registry_id, portainer_registry_auth_header
 
 logger = logging.getLogger(__name__)
 
@@ -637,6 +637,7 @@ def register(mcp: FastMCP) -> None:
                 (`docker service update --force`)
             registry_id: ID of a Portainer-configured registry whose stored
                 credentials the nodes should use to pull the image
+                (auto-detected from the image host when omitted)
             endpoint_id: Target endpoint ID (uses default if omitted)
         """
         _validate_service_id(service_id)
@@ -648,15 +649,18 @@ def register(mcp: FastMCP) -> None:
             not isinstance(replicas, int) or isinstance(replicas, bool) or replicas < 0
         ):
             raise ValueError(f"Invalid replicas: {replicas!r}. Must be a non-negative integer.")
-        headers: dict[str, str] = {}
         if registry_id is not None:
             validate_id(registry_id, "registry_id")
-            headers["X-Registry-Auth"] = portainer_registry_auth_header(registry_id)
 
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         _, spec, version = await _load_service(client, eid, service_id)
+        if registry_id is None and image is not None:
+            registry_id = await match_registry_id(client, image)
+        headers: dict[str, str] = {}
+        if registry_id is not None:
+            headers["X-Registry-Auth"] = portainer_registry_auth_header(registry_id)
 
         changes: dict[str, Any] = {}
         task_template = spec.setdefault("TaskTemplate", {})
@@ -703,6 +707,7 @@ def register(mcp: FastMCP) -> None:
                 "service": spec.get("Name") or service_id,
                 "previous_version": version,
                 "changes": changes,
+                "registry_id": registry_id,
                 "warnings": warnings or [],
             },
             indent=2,

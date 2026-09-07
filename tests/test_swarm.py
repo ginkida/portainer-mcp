@@ -174,6 +174,8 @@ class _SwarmClient:
             return _NODES
         if path.endswith("/docker/containers/json"):
             return self.containers
+        if path == "/api/registries":
+            return [{"Id": 3, "Name": "gitlab", "URL": "reg.local", "Authentication": True}]
         raise AssertionError(path)
 
     async def post(self, path: str, **kwargs: Any) -> Any:
@@ -996,3 +998,32 @@ async def test_swarm_object_lists_never_return_data(tool: str) -> None:
         "created_at": "c",
         "updated_at": "u",
     }
+
+
+async def test_service_update_auto_matches_registry_for_private_image() -> None:
+    fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
+    body = json.loads(
+        _text(
+            await _mcp(fake).call_tool(
+                "portainer_service_update", {"service_id": "svc-a-id", "image": "reg.local/app:v2"}
+            )
+        )
+    )
+    assert body["registry_id"] == 3
+    assert fake.update is not None
+    assert json.loads(base64.b64decode(fake.update["headers"]["X-Registry-Auth"])) == {
+        "registryId": 3
+    }
+    # Docker Hub image: no lookup, no header. Force-only: no image, no lookup.
+    for args in ({"image": "nginx:1.25"}, {"force_restart": True}):
+        fake = _SwarmClient([_service("svc-a-id", "etl_backend")])
+        body = json.loads(
+            _text(
+                await _mcp(fake).call_tool(
+                    "portainer_service_update", {"service_id": "svc-a-id", **args}
+                )
+            )
+        )
+        assert body["registry_id"] is None
+        assert fake.update is not None and fake.update["headers"] == {}
+        assert not any(p == "/api/registries" for p, _ in fake.gets)
