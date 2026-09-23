@@ -19,6 +19,8 @@ def build_client(handler: Handler) -> PortainerClient:
     client._http = httpx.AsyncClient(
         base_url="https://portainer.test",
         transport=httpx.MockTransport(handler),
+        # Keep the production cookie policy (a plain Cookies copy would drop it).
+        cookies=client._http.cookies.jar,
     )
     return client
 
@@ -112,6 +114,51 @@ async def test_401_triggers_reauth_and_retry() -> None:
     assert data == {"ok": True}
     assert calls["auth"] == 2  # initial + re-auth on 401
     assert client._auth_version == 2
+
+
+async def test_session_cookie_is_never_replayed() -> None:
+    """Portainer enforces CSRF only on requests carrying its session cookie.
+
+    Regression: httpx kept ``portainer_api_key`` from ``POST /api/auth``, so a
+    re-auth after a 401 went out with the cookie and no Referer and Portainer
+    2.39 answered ``403 Forbidden - referer not supplied``. The fake mirrors
+    that rule: an unsafe request with the cookie but without Referer is 403.
+    """
+    calls = {"auth": 0, "data": 0}
+    cookies_seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cookies_seen.append(request.headers.get("cookie"))
+        if (
+            request.method in {"POST", "PUT", "DELETE", "PATCH"}
+            and request.headers.get("cookie")
+            and not request.headers.get("referer")
+        ):
+            return httpx.Response(403, text="Forbidden - referer not supplied")
+        if request.url.path == "/api/auth":
+            calls["auth"] += 1
+            return httpx.Response(
+                200,
+                json={"jwt": f"JWT{calls['auth']}"},
+                headers={"Set-Cookie": "portainer_api_key=SESSION; Path=/; HttpOnly"},
+            )
+        if request.url.path == "/api/status":
+            return httpx.Response(200, json={}, headers={"X-CSRF-Token": "C1"})
+        calls["data"] += 1
+        if calls["data"] == 1:
+            return httpx.Response(401, text="unauthorized")
+        return httpx.Response(200, json={"ok": True})
+
+    client = build_client(handler)
+    try:
+        data = await client.get("/api/endpoints")
+    finally:
+        await client.close()
+
+    assert data == {"ok": True}
+    assert calls["auth"] == 2  # the re-auth POST went through
+    assert cookies_seen and all(c is None for c in cookies_seen)
+    assert not client._http.cookies
 
 
 async def test_403_csrf_refresh_and_token_reharvest() -> None:

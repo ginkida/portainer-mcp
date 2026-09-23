@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 
 import httpx
@@ -21,6 +22,21 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
 # more than this almost certainly signals a misconfigured endpoint, and parsing
 # it would needlessly inflate memory.
 _MAX_RESPONSE_BYTES = 50_000_000
+
+
+def _cookieless_jar() -> CookieJar:
+    """A cookie jar that refuses every cookie.
+
+    ``POST /api/auth`` also sets the browser session cookie
+    (``portainer_api_key``). Portainer enforces CSRF — gorilla/csrf's Origin /
+    Referer + token check — only on requests that carry that cookie
+    (``security.ShouldSkipCSRFCheck``); a Bearer-only request skips it. With a
+    default jar httpx would replay the cookie, so a re-auth ``POST /api/auth``
+    (no Referer by design) after a 401 or the JWT TTL came back as
+    ``403 Forbidden - referer not supplied``. We authenticate with the header,
+    never the cookie, so none is stored.
+    """
+    return CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
 
 
 class PortainerClient:
@@ -53,6 +69,7 @@ class PortainerClient:
             base_url=config.url,
             verify=config.verify_ssl,
             timeout=config.timeout,
+            cookies=_cookieless_jar(),
             limits=httpx.Limits(
                 max_connections=config.http_max_connections,
                 max_keepalive_connections=config.http_max_keepalive,
@@ -68,7 +85,8 @@ class PortainerClient:
     async def _do_authenticate(self) -> None:
         config = get_config()
         logger.debug("Authenticating to Portainer as %s", config.username)
-        # POST /api/auth must NOT include Referer (Portainer 2.39+ rejects it)
+        # No Referer / CSRF token here. Without the session cookie (see
+        # _cookieless_jar) Portainer skips the CSRF check for this call.
         resp = await self._http.post(
             "/api/auth",
             json={"username": config.username, "password": config.password},
@@ -146,8 +164,9 @@ class PortainerClient:
             # check when the request authenticates with an API key.
             return {"X-API-Key": self._api_key}
         h: dict[str, str] = {"Authorization": f"Bearer {self._jwt}"}
-        # Referer + CSRF token only for mutating methods.
-        # GET with Referer triggers CSRF validation in Portainer 2.39+.
+        # Referer + CSRF token only for mutating methods. With no session
+        # cookie Portainer skips CSRF for Bearer requests, so these are
+        # belt-and-braces for a proxy that injects the cookie, not a need.
         if method.upper() in _UNSAFE_METHODS:
             h["Referer"] = self._base_url_str
             if self._csrf_token:
