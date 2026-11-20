@@ -36,6 +36,11 @@ it like a standalone host). On a manager, think in services and tasks, not \
 containers: use portainer_stack_status, portainer_services_list, \
 portainer_service_tasks and portainer_service_logs first; containers are transient \
 task instances.
+- For a time range, pass since to portainer_container_logs_grep or \
+portainer_stack_logs_errors, or pass both since and until to portainer_service_logs. \
+Check first_ts, last_ts, returned_last_ts, truncation_reason and any source failures. \
+When enabled, portainer_laravel_errors groups exceptions from stderr and the \
+current Laravel log file for the same window.
 - Before editing a stack, ALWAYS call portainer_stack_inspect (with reveal_env=true \
 if you intend to resend the compose file) and base your change on the current \
 file. Values shown as [REDACTED] are masked credentials — never write them back.

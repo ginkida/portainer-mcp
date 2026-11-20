@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import re
 import time
+from contextlib import aclosing
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
 from ..client import PortainerClient, get_client
 from ..config import get_config
-from ..errors import redact_env_strings, resolve_endpoint, tool_error_handler, validate_id
+from ..errors import (
+    redact_env_strings,
+    redact_secrets,
+    resolve_endpoint,
+    tool_error_handler,
+    validate_id,
+)
 from .containers import (
-    _MAX_LOG_CHARS,
     _STACK_NAME_RE,
     _container_labels,
     _log_params,
@@ -25,6 +33,15 @@ from .images import (
     CRED_AMBIGUOUS,
     _validate_image_ref,
     registry_auth_headers,
+)
+from .logs import (
+    _DEFAULT_LOG_BYTES,
+    _DEFAULT_LOG_MATCHES,
+    _MAX_LOG_CHARS,
+    _clamp_matches,
+    _docker_window_lines,
+    _LogCoverage,
+    _LogWindow,
 )
 
 logger = logging.getLogger(__name__)
@@ -571,27 +588,72 @@ def register(mcp: FastMCP) -> None:
         since: str | None = None,
         timestamps: bool = False,
         endpoint_id: int | None = None,
+        until: str | None = None,
+        max_matches: int | None = None,
+        max_bytes: int | None = None,
     ) -> str:
         """Get logs of a Swarm service (all its tasks, across nodes).
 
+        With `since` and an explicit `until`, `max_matches` or `max_bytes`, scans
+        the window and returns its most recent lines in timestamp order.
+        Swarm applies the lower bound. The MCP server applies the upper bound
+        to the timestamped records and counts downloaded bytes toward the limit.
+
         Args:
             service_id: Service ID or name
-            tail: Number of lines from the end of the logs (default 100, max 1000)
+            tail: Lines to fetch in tail mode (default 100, max 1000)
             since: Only lines newer than this: a duration ("10m", "2h", "1d"),
                 a Unix timestamp or an ISO-8601 datetime
             timestamps: Prefix every line with its timestamp (default false)
             endpoint_id: Target endpoint ID (uses default if omitted)
+            until: End of the window, same formats as since (default: now)
+            max_matches: Window lines to return (default 200, max 1000)
+            max_bytes: Window Docker response byte limit (default 32 MiB)
         """
         _validate_service_id(service_id)
         tail = max(1, min(tail, 1000))
-        params = _log_params(tail, since, timestamps)
+        window = None
+        if until is not None or max_bytes is not None or max_matches is not None:
+            window = _LogWindow.parse(since, until)
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
+        path = f"/api/endpoints/{eid}/docker/services/{quote(service_id, safe='')}/logs"
+        if window is not None:
+            byte_limit = _DEFAULT_LOG_BYTES if max_bytes is None else max(1, max_bytes)
+            coverage = _LogCoverage(window, byte_limit)
+            limit = _clamp_matches(_DEFAULT_LOG_MATCHES if max_matches is None else max_matches)
+            recent: list[tuple[int, int, str, str]] = []
+            async with aclosing(_docker_window_lines(
+                client, path, coverage, config.long_timeout, swarm=True, timestamps=timestamps,
+            )) as lines:
+                async for _, text, ns, stamp in lines:
+                    order = (ns, coverage.lines_scanned)
+                    if len(recent) == limit and order <= recent[0][:2]:
+                        continue
+                    candidate = (*order, stamp, redact_secrets(text))
+                    if len(recent) == limit:
+                        heapq.heapreplace(recent, candidate)
+                    else:
+                        heapq.heappush(recent, candidate)
+
+            output_lines = []
+            remaining = _MAX_LOG_CHARS
+            for ns, _, stamp, line in sorted(recent, reverse=True):
+                remaining -= len(line) + 1
+                if remaining < 0:
+                    break
+                output_lines.append(line + "\n")
+                coverage.returned(ns, stamp)
+            return json.dumps({
+                "service": service_id, **window.bounds(),
+                **coverage.summary(len(output_lines) < coverage.lines_scanned),
+                "logs": "".join(reversed(output_lines)),
+            }, indent=2, ensure_ascii=False)
+
         resp = await client.request(
-            "GET",
-            f"/api/endpoints/{eid}/docker/services/{service_id}/logs",
-            params=params,
+            "GET", path,
+            params=_log_params(tail, since, timestamps),
             timeout=config.long_timeout,
         )
         output = _parse_docker_stream(resp.content)

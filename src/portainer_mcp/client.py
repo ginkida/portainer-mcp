@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 
@@ -22,6 +24,7 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
 # more than this almost certainly signals a misconfigured endpoint, and parsing
 # it would needlessly inflate memory.
 _MAX_RESPONSE_BYTES = 50_000_000
+_STREAM_ERROR_BYTES = 8_192
 
 
 def _cookieless_jar() -> CookieJar:
@@ -180,6 +183,23 @@ class PortainerClient:
         timeout: float | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
+        return await self._request(method, path, timeout, stream=False, **kwargs)
+
+    @asynccontextmanager
+    async def stream(
+        self, method: str, path: str, timeout: float | None = None, **kwargs: Any,
+    ) -> AsyncIterator[httpx.Response]:
+        """Open an authenticated stream. The caller applies its body limit."""
+        headers = {**(kwargs.pop("headers", None) or {}), "Accept-Encoding": "identity"}
+        resp = await self._request(method, path, timeout, stream=True, headers=headers, **kwargs)
+        try:
+            yield resp
+        finally:
+            await resp.aclose()
+
+    async def _request(
+        self, method: str, path: str, timeout: float | None, *, stream: bool, **kwargs: Any,
+    ) -> httpx.Response:
         await self._ensure_auth()
         # Capture the auth generation we're about to use, so retry logic
         # can tell whether another concurrent task already refreshed.
@@ -191,46 +211,61 @@ class PortainerClient:
         # retries via **kwargs; when None we leave the client default in place.
         if timeout is not None:
             kwargs["timeout"] = timeout
-        merged_headers = {**user_headers, **self._headers(method)}
-        resp = await self._http.request(method, path, headers=merged_headers, **kwargs)
-        await self._capture_csrf(resp)
-        if self._api_key is not None:
-            # A static key can't be refreshed: a 401/403 is final, so skip the
-            # re-auth/retry branches entirely (and never re-send a mutation).
-            pass
-        elif resp.status_code == 401:
-            logger.debug("Token expired, re-authenticating")
-            await self._refresh_auth(attempted_version)
-            attempted_version = self._auth_version
-            if method.upper() in _UNSAFE_METHODS:
-                logger.warning(
-                    "Retrying %s %s after 401; the mutation may be applied twice "
-                    "if it had already taken effect server-side.",
-                    method,
-                    path,
-                )
+        for attempt in range(2):
             merged_headers = {**user_headers, **self._headers(method)}
-            resp = await self._http.request(method, path, headers=merged_headers, **kwargs)
-            await self._capture_csrf(resp)
-        # `elif`, not `if`: the 403-CSRF branch must not chain off the 401-retry
-        # response, or a single request() could re-auth twice and send a
-        # mutating request three times. One retry per call, whatever the cause.
-        elif resp.status_code == 403 and "CSRF" in resp.text:
-            logger.debug("CSRF token expired, refreshing")
+            if stream:
+                request = self._http.build_request(method, path, headers=merged_headers, **kwargs)
+                opened = await self._http.send(request, stream=True)
+            else:
+                opened = await self._http.request(method, path, headers=merged_headers, **kwargs)
+            keep_open = False
+            try:
+                await self._capture_csrf(opened)
+                resp = opened
+                can_retry = attempt == 0 and self._api_key is None
+                retry_401 = can_retry and resp.status_code == 401
+                if stream and not resp.is_success and not retry_401:
+                    resp = await self._stream_error(opened)
+                retry = retry_401 or (
+                    can_retry and resp.status_code == 403 and "CSRF" in resp.text
+                )
+                if not retry:
+                    if not stream:
+                        self._enforce_response_size(resp)
+                    resp.raise_for_status()
+                    keep_open = True
+                    return resp
+            finally:
+                if stream and not keep_open:
+                    await opened.aclose()
+
+            # Close a rejected stream before refreshing auth, which may need
+            # the same connection slot. Both modes retry at most once.
+            reason = "401" if resp.status_code == 401 else "403 CSRF"
+            logger.debug("Refreshing authentication after %s", reason)
             await self._refresh_auth(attempted_version)
             if method.upper() in _UNSAFE_METHODS:
                 logger.warning(
-                    "Retrying %s %s after 403 CSRF; the mutation may be applied "
+                    "Retrying %s %s after %s; the mutation may be applied "
                     "twice if it had already taken effect server-side.",
                     method,
                     path,
+                    reason,
                 )
-            merged_headers = {**user_headers, **self._headers(method)}
-            resp = await self._http.request(method, path, headers=merged_headers, **kwargs)
-            await self._capture_csrf(resp)
-        self._enforce_response_size(resp)
-        resp.raise_for_status()
-        return resp
+        raise AssertionError("Request retry loop exhausted")
+
+    @staticmethod
+    async def _stream_error(resp: httpx.Response) -> httpx.Response:
+        # Keep a small body for CSRF detection and the tool's error envelope.
+        body = bytearray()
+        if resp.is_stream_consumed:
+            body.extend(resp.content[:_STREAM_ERROR_BYTES])
+        else:
+            async for chunk in resp.aiter_raw():
+                body.extend(chunk[:_STREAM_ERROR_BYTES - len(body)])
+                if len(body) == _STREAM_ERROR_BYTES:
+                    break
+        return httpx.Response(resp.status_code, content=bytes(body), request=resp.request)
 
     @staticmethod
     def _decode(resp: httpx.Response) -> Any:

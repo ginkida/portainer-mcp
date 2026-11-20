@@ -1348,15 +1348,11 @@ async def test_container_logs_since_and_timestamps_forwarded() -> None:
     assert fake.params == {"stdout": "true", "stderr": "true", "tail": "100"}
 
 
-async def test_logs_grep_since_forwarded_and_bad_since_rejected() -> None:
+async def test_logs_grep_bad_since_rejected_before_request() -> None:
     mcp = FastMCP("t")
     containers.register(mcp)
     fake = _LogParamsClient()
     client_mod._client = fake  # type: ignore[assignment]
-    await mcp.call_tool(
-        "portainer_container_logs_grep", {"container_id": "abc", "pattern": "x", "since": "10m"}
-    )
-    assert fake.params is not None and "since" in fake.params
     body = json.loads(
         _text(
             await mcp.call_tool(
@@ -1367,6 +1363,7 @@ async def test_logs_grep_since_forwarded_and_bad_since_rejected() -> None:
     )
     assert body["error"] == "Validation error"
     assert "since" in body["details"]
+    assert fake.params is None
 
 
 # --- image_pull: registry_id -> Portainer-managed credentials ----------------------

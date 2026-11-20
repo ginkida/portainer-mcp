@@ -356,7 +356,7 @@ async def test_service_logs_envelope_and_params() -> None:
         _text(
             await _mcp(fake).call_tool(
                 "portainer_service_logs",
-                {"service_id": "etl_backend", "tail": 5000, "since": "2h", "timestamps": True},
+                {"service_id": "etl_backend", "tail": 5000, "timestamps": True},
             )
         )
     )
@@ -367,7 +367,8 @@ async def test_service_logs_envelope_and_params() -> None:
     assert fake.log_params is not None
     assert fake.log_params["tail"] == "1000"
     assert fake.log_params["timestamps"] == "true"
-    assert fake.log_params["since"].isdigit()
+    assert "since" not in fake.log_params
+    assert set(body) == {"service", "tail", "since", "truncated", "total_chars", "logs"}
 
 
 # --- service_update -------------------------------------------------------------------

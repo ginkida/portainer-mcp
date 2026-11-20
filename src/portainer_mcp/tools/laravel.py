@@ -3,20 +3,45 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import shlex
+from collections.abc import Callable
+from contextlib import aclosing
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone, tzinfo
+from typing import Any
+from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
-from ..client import get_client
+from ..client import PortainerClient, get_client
 from ..config import get_config
-from ..errors import redact_secrets, resolve_endpoint, tool_error_handler
+from ..errors import PortainerResponseError, redact_secrets, resolve_endpoint, tool_error_handler
 from .containers import (
-    _MAX_LOG_CHARS,
+    _ERROR_LINE_RE,
     _MAX_STACK_TARGETS,
     _STACK_FANOUT_LIMIT,
     _STACK_NAME_RE,
     _cap_lines,
     _parse_docker_stream,
     _stack_targets,
+    _validate_container_id,
+    _window_stack_targets,
+    _WindowTarget,
+)
+from .logs import (
+    _DEFAULT_LOG_BYTES,
+    _DEFAULT_LOG_MATCHES,
+    _MAX_LOG_CHARS,
+    _NS,
+    _clamp_matches,
+    _docker_window_lines,
+    _iso_ns,
+    _LogCoverage,
+    _LogWindow,
+    _read_log_lines,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,6 +49,345 @@ logger = logging.getLogger(__name__)
 # Opinionated helpers for Laravel stacks (a `backend` service with the app at
 # /var/www/app). They are registered only when PORTAINER_ENABLE_LARAVEL_TOOLS
 # is true — on other infrastructures they are just noise in the tool list.
+_LARAVEL_LOG_PATH = "/var/www/app/storage/logs/laravel.log"
+_MAX_LARAVEL_GROUP_KEYS = 10_000
+_MAX_FILE_RECORD_KEYS = 100_000
+_CHANNEL_HEADER = r"[\w.-]+\.(?:DEBUG|INFO|NOTICE|WARNING|ERROR|CRITICAL|ALERT|EMERGENCY):"
+_FILE_TIMESTAMP_RE = re.compile(rf"^\[([\dT:.+ Z-]{{19,40}})\] (?={_CHANNEL_HEADER})")
+_STDERR_HEADER_RE = re.compile(rf"^(?:{_CHANNEL_HEADER}|PHP Fatal error:|Fatal error:|Uncaught )")
+_FILE_INFO_RE = re.compile(r"^PORTAINER_LARAVEL (\d{1,20}) (\S{1,16})$")
+_UTC_OFFSET_RE = re.compile(r"([+-])([01]\d|2[0-3]):?([0-5]\d)")
+_EXCEPTION_CLASS = r"[\w\\]{1,255}"
+_EXCEPTION_LOCATION = r"(?P<file>/[^\r\n:]{1,512}):(?P<line>[0-9]{1,10})"
+_MONOLOG_EXCEPTION_RE = re.compile(
+    rf"\[object\] \((?P<class>{_EXCEPTION_CLASS})\(code: [^)]{{1,32}}\): "
+)
+_MONOLOG_LOCATION_RE = re.compile(rf" at {_EXCEPTION_LOCATION}(?=\)|\\n|$)")
+_PHP_EXCEPTION_RE = re.compile(rf"\bUncaught (?P<class>{_EXCEPTION_CLASS}): ")
+_PHP_LOCATION_RE = re.compile(rf" in {_EXCEPTION_LOCATION}(?=\s|$)")
+_JSON_LOCATION_RE = re.compile(_EXCEPTION_LOCATION)
+_EXCEPTION_CLASS_RE = re.compile(_EXCEPTION_CLASS)
+
+
+def _laravel_record(text: str) -> tuple[str | None, str, dict[str, Any]]:
+    """Return the file timestamp, record text and optional Monolog JSON object."""
+    if match := _FILE_TIMESTAMP_RE.match(text):
+        return match[1], text[match.end():], {}
+    if text.startswith("{") and len(text) <= _MAX_LOG_CHARS:
+        try:
+            entry = json.loads(text)
+        except (ValueError, RecursionError):
+            pass
+        else:
+            if isinstance(entry, dict):
+                dt = entry.get("datetime")
+                return dt if isinstance(dt, str) else None, text, entry
+    return None, text, {}
+
+
+def _exception_site(text: str, entry: dict[str, Any]) -> tuple[str, str, int] | None:
+    if entry:
+        context = entry.get("context")
+        exception = context.get("exception") if isinstance(context, dict) else None
+        if isinstance(exception, dict):
+            cls, path = exception.get("class"), exception.get("file")
+            if (
+                isinstance(cls, str) and _EXCEPTION_CLASS_RE.fullmatch(cls)
+                and isinstance(path, str) and (match := _JSON_LOCATION_RE.fullmatch(path))
+            ):
+                return cls, match["file"], int(match["line"])
+    # Only look for the logged exception header, ignoring stacktrace frames.
+    for header, location in (
+        (_MONOLOG_EXCEPTION_RE, _MONOLOG_LOCATION_RE),
+        (_PHP_EXCEPTION_RE, _PHP_LOCATION_RE),
+    ):
+        start = header.search(text)
+        if start and (site := location.search(text, pos=start.end())):
+            return start["class"].replace("\\\\", "\\"), site["file"], int(site["line"])
+    return None
+
+
+class _LaravelRecords:
+    """Assemble one bounded record at a time for a file or container stream."""
+
+    def __init__(self, record: Callable[[str, dict[str, Any], int, str], None]) -> None:
+        self._record = record
+        self._stamp: tuple[int, str] | None = None
+        self._parts: list[str] = []
+        self._remaining = 0
+
+    def start(self, text: str, entry: dict[str, Any], ns: int, stamp: str) -> None:
+        self.finish()
+        if entry:
+            self._record(text, entry, ns, stamp)
+        else:
+            self._stamp = (ns, stamp)
+            self.append(text)
+
+    def append(self, line: str) -> None:
+        if self._stamp is None:
+            return
+        if line.lstrip().startswith(("[stacktrace]", "[previous exception]")):
+            self.finish()
+        elif not self._parts or self._remaining > 0:
+            remaining = self._remaining if self._parts else _MAX_LOG_CHARS
+            self._parts.append(line[:remaining])
+            self._remaining = remaining - len(line) - 1
+
+    def finish(self) -> None:
+        if self._stamp is not None:
+            self._record("\n".join(self._parts), {}, *self._stamp)
+        self._stamp = None
+        self._parts.clear()
+
+
+@dataclass
+class _ExceptionGroup:
+    first: tuple[int, str]
+    last: tuple[int, str]
+    counts: dict[str, int] = field(default_factory=lambda: {"stderr": 0, "file": 0})
+
+    @property
+    def count(self) -> int:
+        return self.counts["stderr"] + self.counts["file"]
+
+
+def _log_timezone(value: str) -> tzinfo:
+    if match := _UTC_OFFSET_RE.fullmatch(value):
+        offset = timedelta(hours=int(match[2]), minutes=int(match[3]))
+        return timezone(-offset if match[1] == "-" else offset)
+    try:
+        return ZoneInfo(value)
+    except (ValueError, ZoneInfoNotFoundError):
+        raise ValueError(f"Invalid timezone: {value!r}. Use an IANA name or UTC offset.") from None
+
+
+def _utc_timestamp(ns: int) -> str:
+    seconds, fraction = divmod(ns, _NS)
+    stamp = datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    return (f"{stamp}.{fraction:09d}".rstrip("0") if fraction else stamp) + "Z"
+
+
+async def _file_window(
+    client: PortainerClient, base: str, target: _WindowTarget, coverage: _LogCoverage,
+    timeout: float, record: Callable[[str, dict[str, Any], int, str], None],
+    zone_override: tzinfo | None,
+) -> dict[str, Any]:
+    # stat and tail can seek directly on regular files, including with BusyBox.
+    # Only a fixed path and an integer size are interpolated into the shell.
+    log_path = shlex.quote(_LARAVEL_LOG_PATH)
+    tail_bytes = coverage.max_bytes
+    cmd = (
+        f"if [ -f {log_path} ]; then "
+        f"size=$(stat -c %s {log_path} 2>/dev/null || stat -f %z {log_path}) || exit 1; "
+        "offset=$(date +%z) || offset=unknown; "
+        'printf "PORTAINER_LARAVEL %s %s\n" "$size" "$offset"; '
+        f"exec tail -c {tail_bytes} {log_path}; "
+        f"elif [ -e {log_path} ]; then exit 4; else exit 3; fi"
+    )
+    headers = target.headers
+    created = await client.post(
+        f"{base}/containers/{quote(target.id, safe='')}/exec", headers=headers,
+        json={"AttachStdout": True, "AttachStderr": True, "Cmd": ["sh", "-c", cmd]},
+    )
+    exec_id = created.get("Id") if isinstance(created, dict) else None
+    if not isinstance(exec_id, str):
+        raise PortainerResponseError("Docker did not return a Laravel file exec ID")
+    _validate_container_id(exec_id)
+    path = f"{base}/exec/{quote(exec_id, safe='')}"
+    size = None
+    zone = zone_override
+    from_entry: tuple[int, str] | None = None
+    records = _LaravelRecords(record)
+
+    async with aclosing(_read_log_lines(
+        client, "POST", f"{path}/start", coverage=coverage, timeout=timeout,
+        # The shell caps file bytes. Allow metadata and up to eight framing
+        # bytes per payload byte without reducing the requested file tail.
+        wire_limit=9 * (tail_bytes + 64), headers=headers, json={"Detach": False, "Tty": False},
+    )) as lines:
+        async for stream, line in lines:
+            if stream == 2:
+                continue
+            if size is None:
+                info = _FILE_INFO_RE.fullmatch(line)
+                if info is None:
+                    raise PortainerResponseError("Missing size and timezone in Laravel file output")
+                size = int(info[1])
+                if zone is None:
+                    zone = _log_timezone(info[2])
+                continue
+            stamp, text, entry = _laravel_record(line)
+            if stamp is None:
+                records.append(line)
+                continue
+            records.finish()
+            if len(stamp) > 40:
+                continue
+            assert zone is not None
+            try:
+                ns = _iso_ns(stamp, zone)
+            except ValueError:
+                continue
+            if from_entry is None:
+                from_entry = (ns, stamp)
+            if coverage.scan(ns, stamp):
+                records.start(text, entry, ns, stamp)
+        records.finish()
+
+    if coverage.bytes_limited:
+        status = "partial"
+    else:
+        inspect = await client.get(f"{path}/json", headers=headers)
+        code = inspect.get("ExitCode") if isinstance(inspect, dict) else None
+        status = "error"
+        if isinstance(code, int) and inspect.get("Running") is not True:
+            if code == 0 and size is not None:
+                status = "read"
+            elif code in (3, 4):
+                status = "missing" if code == 3 else "not_regular"
+        if status == "read" and size is not None and size > tail_bytes:
+            if from_entry is None or coverage.window.since < from_entry[0]:
+                coverage.bytes_limited = True
+                status = "partial"
+
+    offset = None
+    if zone is not None and size is not None:
+        instant = from_entry[0] if from_entry else coverage.window.since
+        value = datetime.fromtimestamp(instant // _NS, zone).strftime("%z")
+        offset = value[:3] + ":" + value[3:5]
+    return {
+        "status": status, "read_from_ts": from_entry[1] if from_entry else None,
+        "timezone_offset": offset, **coverage.summary(),
+    }
+
+
+async def _laravel_window(
+    client: PortainerClient, eid: int, stack_name: str, targets: list[_WindowTarget],
+    window: _LogWindow, timeout: float, max_groups: int, max_bytes: int,
+    zone_override: tzinfo | None,
+) -> str:
+    groups: dict[tuple[str, str, int], _ExceptionGroup] = {}
+    file_max_counts: dict[tuple[int, tuple[str, str, int]], int] = {}
+    ungrouped = 0
+    omitted = 0
+    sem = asyncio.Semaphore(_STACK_FANOUT_LIMIT)
+    base = f"/api/endpoints/{eid}/docker"
+
+    def record(
+        text: str, entry: dict[str, Any], ns: int, timestamp: str,
+        file_counts: dict[tuple[int, tuple[str, str, int]], int] | None = None,
+    ) -> None:
+        nonlocal ungrouped, omitted
+        site = _exception_site(text, entry)
+        if site is None:
+            level = entry.get("level")
+            if _ERROR_LINE_RE.search(text) or (isinstance(level, int) and level >= 400):
+                ungrouped += 1
+            return
+        group = groups.get(site)
+        if group is None and len(groups) >= _MAX_LARAVEL_GROUP_KEYS:
+            omitted += 1
+            return
+        if file_counts is not None:
+            key = (ns, site)
+            previous = file_max_counts.get(key)
+            if previous is None and len(file_max_counts) >= _MAX_FILE_RECORD_KEYS:
+                omitted += 1
+                return
+            # Keep the largest multiplicity across the replicas. Events
+            # repeated in the same second within one file are still counted.
+            count = file_counts.get(key, 0) + 1
+            file_counts[key] = count
+            if previous is not None and count <= previous:
+                return
+            file_max_counts[key] = count
+        ts = (ns, timestamp)
+        if group is None:
+            group = groups[site] = _ExceptionGroup(ts, ts)
+        group.counts["stderr" if file_counts is None else "file"] += 1
+        group.first = min(group.first, ts)
+        group.last = max(group.last, ts)
+
+    async def scan(target: _WindowTarget) -> tuple[str, dict[str, Any]]:
+        docker = _LogCoverage(window, max_bytes)
+        file = _LogCoverage(window, max_bytes)
+        stream_name = "stderr_or_tty"
+        records = _LaravelRecords(record)
+        file_counts: dict[tuple[int, tuple[str, str, int]], int] = {}
+        async with sem:
+            try:
+                path = f"{base}/containers/{quote(target.id, safe='')}/logs"
+                async with aclosing(_docker_window_lines(
+                    client, path, docker, timeout, stderr_only=True, headers=target.headers,
+                )) as lines:
+                    async for stream, text, ns, timestamp in lines:
+                        stream_name = "tty_merged" if stream is None else "stderr"
+                        stamp, payload, entry = _laravel_record(text)
+                        if stamp is not None or entry or _STDERR_HEADER_RE.match(text):
+                            records.start(payload, entry, ns, timestamp)
+                        else:
+                            records.append(text)
+                records.finish()
+                docker_status = "partial" if docker.bytes_limited else "read"
+            except (httpx.HTTPError, PortainerResponseError) as exc:
+                logger.warning("Failed to read Docker logs for %s: %s", target.name, exc)
+                docker_status = "error"
+            try:
+                file_source = await _file_window(
+                    client, base, target, file, timeout,
+                    lambda text, entry, ns, stamp: record(text, entry, ns, stamp, file_counts),
+                    zone_override,
+                )
+            except (httpx.HTTPError, PortainerResponseError, ValueError) as exc:
+                logger.warning("Failed to read Laravel log file for %s: %s", target.name, exc)
+                file_source = {
+                    "status": "error", "read_from_ts": None, "timezone_offset": None,
+                    **file.summary(),
+                }
+        return target.id, {
+            "container": target.name,
+            "sources": {
+                "docker": {"status": docker_status, "stream": stream_name, **docker.summary()},
+                "laravel.log": file_source,
+            },
+        }
+
+    logger.info(
+        "AUDIT: laravel_errors window file exec for stack %r on endpoint %d (%d containers)",
+        stack_name, eid, min(len(targets), _MAX_STACK_TARGETS),
+    )
+    results = dict(await asyncio.gather(*(scan(t) for t in targets[:_MAX_STACK_TARGETS])))
+    ranked = sorted(groups.items(), key=lambda item: (-item[1].count, item[0]))
+    kept = []
+    remaining = _MAX_LOG_CHARS
+    returned = _LogCoverage(window, max_bytes)
+    for (cls, file_path, line), group in ranked[:_clamp_matches(max_groups)]:
+        site = redact_secrets(f"{file_path}:{line}")
+        remaining -= len(cls) + len(site) + len(group.first[1]) + len(group.last[1])
+        if remaining < 0:
+            break
+        kept.append({
+            "exception_class": cls, "file_line": site, "count": group.count,
+            "count_by_source": group.counts, "first_ts": group.first[1], "last_ts": group.last[1],
+        })
+        returned.returned(*group.first)
+        returned.returned(*group.last)
+    body = {
+        "stack": stack_name, **window.bounds(), "log_path": _LARAVEL_LOG_PATH,
+        "containers_scanned": len(results),
+        "containers_omitted": max(0, len(targets) - _MAX_STACK_TARGETS),
+        "containers": results, "groups": kept,
+        "groups_truncated": len(kept) < len(groups) or omitted > 0,
+        "ungrouped_errors": ungrouped, "untracked_group_entries": omitted,
+        "returned_first_ts": _utc_timestamp(returned.returned_first[0])
+        if returned.returned_first else None,
+        "returned_last_ts": _utc_timestamp(returned.returned_last[0])
+        if returned.returned_last else None,
+    }
+    if not targets:
+        body["message"] = f"No running containers found for stack '{stack_name}'"
+    return json.dumps(body, indent=2, ensure_ascii=False)
 
 
 def register(mcp: FastMCP) -> None:
@@ -33,24 +397,42 @@ def register(mcp: FastMCP) -> None:
         stack_name: str,
         tail: int = 50,
         endpoint_id: int | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        max_groups: int = _DEFAULT_LOG_MATCHES,
+        max_bytes: int = _DEFAULT_LOG_BYTES,
+        timezone: str | None = None,
     ) -> str:
-        """Get Laravel application-level errors from storage/logs/laravel.log.
+        """Find Laravel exceptions in running containers of a stack.
 
-        Executes inside each running backend/horizon container of a stack
-        to read the actual Laravel error log (not nginx access log).
-        Returns production.ERROR entries with exception messages and context.
+        With `since`, reads Docker stderr (merged output for TTY containers)
+        and the current /var/www/app/storage/logs/laravel.log when present.
+        Ranks exceptions whose class and file:line can be read from Monolog
+        text/JSON or PHP uncaught-exception headers. File entries shared by
+        replicas are deduplicated. Counts are reported by source. Docker
+        timestamps govern stderr. The file is read from its tail and reports
+        the earliest complete entry. Naive file timestamps default to the
+        container's current UTC offset. Coverage is per container and source.
+        Rotated files and stopped containers are outside this scan.
 
-        Use this AFTER portainer_stack_logs_errors to get root cause details
-        behind HTTP 500 errors seen in nginx access logs.
+        Without `since`, returns the tail of production.ERROR/CRITICAL/EMERGENCY
+        lines from laravel.log in the legacy response format.
 
         Args:
             stack_name: Stack name prefix (e.g. "taylor", "blog", "somnlyx")
-            tail: Number of error lines to return per container (default 50, max 200)
+            tail: File error lines per container without since (default 50, max 200)
             endpoint_id: Target endpoint ID (uses default if omitted)
+            since: Start of window: duration, Unix seconds or ISO-8601 datetime
+            until: End of the window, same formats as since (default: now)
+            max_groups: Window exception groups to return (default 200, max 1000)
+            max_bytes: Window byte limit per source per container (default 32 MiB)
+            timezone: Override for naive file timestamps, as an IANA name or UTC offset
         """
         if not _STACK_NAME_RE.match(stack_name):
             raise ValueError(f"Invalid stack_name: {stack_name!r}")
         tail = max(1, min(tail, 200))
+        window = _LogWindow.parse(since, until)
+        zone_override = _log_timezone(timezone) if window is not None and timezone else None
 
         client = get_client()
         config = get_config()
@@ -60,6 +442,11 @@ def register(mcp: FastMCP) -> None:
             f"/api/endpoints/{eid}/docker/containers/json",
             params={"all": "false"},
         )
+        if window is not None:
+            return await _laravel_window(
+                client, eid, stack_name, _window_stack_targets(containers, stack_name),
+                window, config.long_timeout, max_groups, max(1, max_bytes), zone_override,
+            )
         targets = _stack_targets(containers, stack_name)
 
         if not targets:
@@ -76,7 +463,7 @@ def register(mcp: FastMCP) -> None:
             )
             targets = targets[:_MAX_STACK_TARGETS]
 
-        log_path = "/var/www/app/storage/logs/laravel.log"
+        log_path = _LARAVEL_LOG_PATH
         # The exec command is a fixed read-only grep, but it still runs inside
         # the containers — record the operation and its scope.
         logger.info(

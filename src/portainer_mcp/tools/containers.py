@@ -5,14 +5,36 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
-from typing import Any
+from collections import deque
+from contextlib import aclosing
+from typing import Any, NamedTuple
+from urllib.parse import quote
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
-from ..client import get_client
+from ..client import PortainerClient, get_client
 from ..config import get_config
-from ..errors import redact_secrets, resolve_endpoint, tool_error_handler, validate_filter
+from ..errors import (
+    PortainerResponseError,
+    redact_secrets,
+    resolve_endpoint,
+    tool_error_handler,
+    validate_filter,
+)
+from .logs import (
+    _DEFAULT_LOG_BYTES,
+    _DEFAULT_LOG_MATCHES,
+    _MAX_LOG_CHARS,
+    _docker_window_lines,
+    _LogCoverage,
+    _LogMatches,
+    _LogWindow,
+    _match_budget,
+)
+from .logs import (
+    _parse_since as _parse_since,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +42,6 @@ _CONTAINER_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,127}$")
 # Must stay in sync with stacks.py:_STACK_NAME_RE — Docker Swarm stack names
 # do not allow dots, so neither should we when accepting one as input.
 _STACK_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}$")
-_MAX_LOG_CHARS = 100_000
 
 # Bounds for the multi-container scan helpers: cap how many containers a single
 # call will touch, and how many of those run concurrently, so a huge stack can't
@@ -40,15 +61,6 @@ _MAX_GREP_LINE_CHARS = 8192
 # Docker labels that tie a container to its stack / service (Swarm and Compose).
 _STACK_LABELS = ("com.docker.stack.namespace", "com.docker.compose.project")
 _SERVICE_LABELS = ("com.docker.swarm.service.name", "com.docker.compose.service")
-
-# `since` for log tools: relative durations like "10m" / "2h" / "1d".
-_RELATIVE_SINCE_RE = re.compile(r"^(\d{1,9})([smhd])$")
-_SINCE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-# Unix seconds: 9-10 digits (2001..2286). Shorter all-digit strings are far
-# more likely a compact date typed by mistake than an epoch in 1970.
-_EPOCH_SINCE_RE = re.compile(r"^\d{9,10}$")
-# Fractional seconds in an ISO timestamp (`.123456789`), trimmed to 6 digits.
-_ISO_FRACTION_RE = re.compile(r"(\.\d{1,9})(?=[+\-Z]|$)")
 
 _ERROR_LINE_RE = re.compile(
     r"(?:"
@@ -74,48 +86,8 @@ def _validate_container_id(container_id: str) -> None:
         )
 
 
-def _parse_since(since: str | None) -> int | None:
-    """Turn a user-facing ``since`` into the Unix timestamp Docker expects.
-
-    Accepts a relative duration (``10m``, ``2h``, ``1d``), a Unix timestamp
-    (seconds) or an ISO-8601 / RFC 3339 datetime (``2026-09-07T10:00:00Z``,
-    nanosecond fractions as printed by ``timestamps=true`` included; a naive
-    value is taken as UTC). Returns ``None`` when ``since`` is empty.
-    """
-    if since is None or not since.strip():
-        return None
-    value = since.strip()
-    if len(value) > 64:
-        raise ValueError("Invalid since: too long")
-    m = _RELATIVE_SINCE_RE.match(value)
-    if m:
-        return int(time.time()) - int(m.group(1)) * _SINCE_UNITS[m.group(2)]
-    if _EPOCH_SINCE_RE.match(value):
-        return int(value)
-    if value.isdigit():
-        raise ValueError(
-            f"Invalid since: {value!r}. A Unix timestamp must be 9-10 digits "
-            "(seconds); use ISO-8601 for a date."
-        )
-    # Python 3.10's fromisoformat accepts neither a trailing "Z" nor any
-    # fraction other than exactly 3 or 6 digits (Docker prints 9, humans type
-    # 1) — normalise to "+00:00" and a 6-digit fraction.
-    iso = value[:-1] + "+00:00" if value.endswith("Z") else value
-    iso = _ISO_FRACTION_RE.sub(lambda f: f.group(1)[:7].ljust(7, "0"), iso)
-    try:
-        dt = datetime.fromisoformat(iso)
-    except ValueError:
-        raise ValueError(
-            f"Invalid since: {value!r}. Use a duration (10m, 2h, 1d), "
-            "a Unix timestamp or an ISO-8601 datetime."
-        ) from None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp())
-
-
 def _log_params(tail: int, since: str | None, timestamps: bool) -> dict[str, str]:
-    """Query parameters shared by every Docker logs endpoint we call."""
+    """Query parameters for the buffered tail readers."""
     params = {"stdout": "true", "stderr": "true", "tail": str(tail)}
     if timestamps:
         params["timestamps"] = "true"
@@ -239,6 +211,179 @@ def _cap_lines(lines: list[str], budget: int) -> tuple[list[str], bool]:
                 return [*lines[:idx], line[: remaining - len(marker)] + marker], True
             return lines[:idx], True
     return lines, False
+
+
+class _GrepTimeout(ValueError):
+    pass
+
+
+async def _grep_indices(regex: re.Pattern[str], lines: list[str], timeout: float) -> list[int]:
+    # Check between lines in the worker as well as on the caller's deadline.
+    deadline = time.monotonic() + timeout
+
+    def scan() -> list[int]:
+        hits = []
+        for index, line in enumerate(lines):
+            if time.monotonic() > deadline:
+                raise TimeoutError
+            if regex.search(line[:_MAX_GREP_LINE_CHARS]):
+                hits.append(index)
+        return hits
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(scan), timeout=timeout)
+    except (asyncio.TimeoutError, TimeoutError):
+        raise _GrepTimeout(
+            "Regex search timed out (pattern too complex for this log volume)"
+        ) from None
+
+
+async def _grep_window(
+    client: PortainerClient, path: str, coverage: _LogCoverage, timeout: float,
+    regex: re.Pattern[str], context_lines: int, timestamps: bool, max_matches: int,
+) -> _LogMatches:
+    matches = _LogMatches(_match_budget(max_matches))
+    previous: deque[tuple[int, str, int, str]] = deque(maxlen=context_lines)
+    position = 0
+    last_output = -1
+    context_end = -1
+
+    async def scan(batch: list[tuple[str, int, str]]) -> None:
+        nonlocal position, last_output, context_end
+        hits = set(await _grep_indices(regex, [row[0] for row in batch], _GREP_SCAN_TIMEOUT))
+        for index, (line, ns, stamp) in enumerate(batch):
+            coverage.scan(ns, stamp)
+            if index in hits:
+                kept = matches.match(line)
+                if kept is not None:
+                    for pos, before, before_ns, before_stamp in previous:
+                        if pos > last_output and pos >= position - context_lines:
+                            add_context(before, before_ns, before_stamp)
+                    matches.lines.append(kept)
+                    coverage.returned(ns, stamp)
+                    last_output = position
+                    context_end = position + context_lines
+            else:
+                if position <= context_end:
+                    add_context(line, ns, stamp)
+                    last_output = position
+                previous.append((position, line, ns, stamp))
+            position += 1
+
+    def add_context(line: str, ns: int, stamp: str) -> None:
+        kept = matches.budget.context(line)
+        if kept is None:
+            matches.limited = True
+        else:
+            matches.lines.append(kept)
+            coverage.returned(ns, stamp)
+
+    batch: list[tuple[str, int, str]] = []
+    try:
+        async with aclosing(_docker_window_lines(
+            client, path, coverage, timeout, timestamps=timestamps, track_coverage=False,
+        )) as lines:
+            async for _, text, ns, stamp in lines:
+                batch.append((text, ns, stamp))
+                if len(batch) == 128:
+                    await scan(batch)
+                    batch.clear()
+            if batch:
+                await scan(batch)
+    except _GrepTimeout:
+        coverage.stop_reason = "regex_timeout"
+    return matches
+
+
+class _WindowTarget(NamedTuple):
+    id: str
+    name: str
+    service: str
+    headers: dict[str, str]
+
+
+def _window_stack_targets(
+    containers: list[dict[str, Any]] | None, stack_name: str,
+) -> list[_WindowTarget]:
+    targets = []
+    for container in containers or []:
+        stack, service = _container_labels(container)
+        cid = container["Id"]
+        names = container.get("Names") or []
+        if stack == stack_name:
+            name = names[0].lstrip("/") if names else cid
+        elif stack is None and (matches := _stack_targets([container], stack_name)):
+            _, name = matches[0]
+            # Legacy, unlabelled Swarm and Compose-v1 replica names.
+            service = re.sub(r"[._]\d+$", "", name)
+        else:
+            continue
+        _validate_container_id(cid)
+        portainer = container.get("Portainer")
+        agent = portainer.get("Agent") if isinstance(portainer, dict) else None
+        node = agent.get("NodeName") if isinstance(agent, dict) else None
+        headers = {"X-PortainerAgent-Target": node} if isinstance(node, str) and node else {}
+        targets.append(_WindowTarget(cid, name, service or name, headers))
+    return targets
+
+
+async def _stack_log_window(
+    client: PortainerClient, eid: int, stack_name: str, targets: list[_WindowTarget],
+    window: _LogWindow, timeout: float, max_matches: int, max_bytes: int,
+) -> str:
+    services: dict[str, list[_WindowTarget]] = {}
+    for target in targets[:_MAX_STACK_TARGETS]:
+        services.setdefault(target.service, []).append(target)
+
+    budget = _match_budget(max_matches)
+    sem = asyncio.Semaphore(_STACK_FANOUT_LIMIT)
+    combined = _LogCoverage(window, max_bytes)
+
+    async def scan(replicas: list[_WindowTarget]) -> dict[str, Any]:
+        coverage = _LogCoverage(window, max_bytes)
+        matches = _LogMatches(budget)
+        failed = []
+        scanned = 0
+        attempted = 0
+        async with sem:
+            for target in replicas:
+                attempted += 1
+                path = f"/api/endpoints/{eid}/docker/containers/{quote(target.id, safe='')}/logs"
+                try:
+                    async with aclosing(_docker_window_lines(
+                        client, path, coverage, timeout, headers=target.headers,
+                    )) as lines:
+                        async for _, text, ns, stamp in lines:
+                            if _ERROR_LINE_RE.search(text):
+                                kept = matches.match(text)
+                                if kept is not None:
+                                    matches.lines.append(kept)
+                                    coverage.returned(ns, stamp)
+                    scanned += 1
+                except (httpx.HTTPError, PortainerResponseError) as exc:
+                    failed.append(target.name)
+                    logger.warning("Failed to read logs for %s: %s", target.name, exc)
+                if coverage.bytes_limited:
+                    break
+        combined.include(coverage)
+        return {
+            **coverage.summary(matches.limited), "errors_found": matches.found,
+            "errors": matches.lines, "containers_scanned": scanned,
+            "containers_failed": failed, "containers_skipped": len(replicas) - attempted,
+        }
+
+    scans = await asyncio.gather(*(scan(replicas) for replicas in services.values()))
+    results = dict(zip(services, scans, strict=True))
+    matches_limited = any(r["truncation_reason"] == "matches_limit" for r in scans)
+    body = {
+        "stack": stack_name, **window.bounds(), **combined.summary(matches_limited),
+        "total_errors": sum(r["errors_found"] for r in results.values()),
+        "containers_omitted": max(0, len(targets) - _MAX_STACK_TARGETS),
+        "services": results,
+    }
+    if not targets:
+        body["message"] = f"No running containers found for stack '{stack_name}'"
+    return json.dumps(body, indent=2, ensure_ascii=False)
 
 
 def register(mcp: FastMCP) -> None:
@@ -481,27 +626,33 @@ def register(mcp: FastMCP) -> None:
         since: str | None = None,
         timestamps: bool = False,
         endpoint_id: int | None = None,
+        until: str | None = None,
+        max_matches: int = _DEFAULT_LOG_MATCHES,
+        max_bytes: int = _DEFAULT_LOG_BYTES,
     ) -> str:
         """Search container logs for lines matching a regex pattern.
 
         Returns only matching lines (with optional context). Useful for
-        finding specific errors, status codes, or keywords without
-        downloading the full log.
+        finding specific errors, status codes, or keywords. With `since`, the
+        MCP server scans the time window even after reaching the match limit.
 
         Args:
             container_id: Container ID or name
             pattern: Regex pattern to search for (case-insensitive)
-            tail: Number of log lines to fetch before filtering (default 500, max 1000)
+            tail: Lines to fetch without since (default 500, max 1000)
             context_lines: Lines of context around each match (default 0, max 5)
             since: Only scan lines newer than this: a duration ("10m", "2h",
                 "1d"), a Unix timestamp or an ISO-8601 datetime
             timestamps: Prefix every line with its timestamp (default false)
             endpoint_id: Target endpoint ID (uses default if omitted)
+            until: End of the window, same formats as since (default: now)
+            max_matches: Window matches to return (default 200, max 1000)
+            max_bytes: Window Docker response byte limit (default 32 MiB)
         """
         _validate_container_id(container_id)
         tail = max(1, min(tail, 1000))
         context_lines = max(0, min(context_lines, 5))
-        params = _log_params(tail, since, timestamps)
+        window = _LogWindow.parse(since, until)
         if len(pattern) > _MAX_GREP_PATTERN_CHARS:
             raise ValueError(
                 f"Regex pattern too long (max {_MAX_GREP_PATTERN_CHARS} chars)"
@@ -514,40 +665,28 @@ def register(mcp: FastMCP) -> None:
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
+        path = f"/api/endpoints/{eid}/docker/containers/{quote(container_id, safe='')}/logs"
+        if window is not None:
+            coverage = _LogCoverage(window, max(1, max_bytes))
+            matches = await _grep_window(
+                client, path, coverage, config.long_timeout, regex, context_lines,
+                timestamps, max_matches,
+            )
+            return json.dumps({
+                "container_id": container_id, "pattern": pattern, **window.bounds(),
+                **coverage.summary(matches.limited), "matches_found": matches.found,
+                "lines": matches.lines,
+            }, indent=2, ensure_ascii=False)
+
         resp = await client.request(
-            "GET",
-            f"/api/endpoints/{eid}/docker/containers/{container_id}/logs",
-            params=params,
+            "GET", path,
+            params=_log_params(tail, since, timestamps),
             timeout=config.long_timeout,
         )
         text = _parse_docker_stream(resp.content)
         lines = text.splitlines()
 
-        # A user-supplied regex can backtrack catastrophically. Run the whole
-        # scan in a worker thread under a hard deadline so a pathological
-        # pattern can never block the event loop / freeze the server. The
-        # worker also checks the deadline itself between lines and only
-        # matches the first _MAX_GREP_LINE_CHARS of each, so a timed-out scan
-        # stops burning a CPU core soon after the caller has given up.
-        deadline = time.monotonic() + _GREP_SCAN_TIMEOUT
-
-        def _scan(buf: list[str]) -> list[int]:
-            hits: list[int] = []
-            for i, line in enumerate(buf):
-                if time.monotonic() > deadline:
-                    raise TimeoutError
-                if regex.search(line[:_MAX_GREP_LINE_CHARS]):
-                    hits.append(i)
-            return hits
-
-        try:
-            hit_indices = await asyncio.wait_for(
-                asyncio.to_thread(_scan, lines), timeout=_GREP_SCAN_TIMEOUT
-            )
-        except (asyncio.TimeoutError, TimeoutError):
-            raise ValueError(
-                "Regex search timed out (pattern too complex for this log volume)"
-            ) from None
+        hit_indices = await _grep_indices(regex, lines, _GREP_SCAN_TIMEOUT)
 
         if context_lines > 0 and hit_indices:
             visible: set[int] = set()
@@ -582,22 +721,31 @@ def register(mcp: FastMCP) -> None:
         stack_name: str,
         tail: int = 500,
         endpoint_id: int | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        max_matches: int = _DEFAULT_LOG_MATCHES,
+        max_bytes: int = _DEFAULT_LOG_BYTES,
     ) -> str:
         """Scan all running containers in a stack for errors.
 
-        Fetches logs from every running container whose name starts with
-        the given stack name and filters for common error patterns:
-        HTTP 4xx/5xx, exceptions, fatal/critical/emergency log levels,
-        panics, OOM, PHP errors, segfaults, etc.
+        Looks for HTTP 4xx/5xx, exceptions, fatal/critical/emergency log
+        levels, panics, OOM, PHP errors, and similar patterns. Window scans
+        find running replicas by stack labels or legacy names, share a byte
+        limit across replicas, and report coverage and failures by service.
 
         Args:
             stack_name: Stack name prefix (e.g. "taylor", "blog", "somnlyx")
-            tail: Log lines per container to scan (default 500, max 1000)
+            tail: Lines to scan per container without since (default 500, max 1000)
             endpoint_id: Target endpoint ID (uses default if omitted)
+            since: Start of window: duration, Unix seconds or ISO-8601 datetime
+            until: End of the window, same formats as since (default: now)
+            max_matches: Window matches to return across the stack (default 200, max 1000)
+            max_bytes: Window Docker response byte limit per service (default 32 MiB)
         """
         if not _STACK_NAME_RE.match(stack_name):
             raise ValueError(f"Invalid stack_name: {stack_name!r}")
         tail = max(1, min(tail, 1000))
+        window = _LogWindow.parse(since, until)
 
         client = get_client()
         config = get_config()
@@ -607,6 +755,11 @@ def register(mcp: FastMCP) -> None:
             f"/api/endpoints/{eid}/docker/containers/json",
             params={"all": "false"},
         )
+        if window is not None:
+            return await _stack_log_window(
+                client, eid, stack_name, _window_stack_targets(containers, stack_name),
+                window, config.long_timeout, max_matches, max(1, max_bytes),
+            )
         targets = _stack_targets(containers, stack_name)
 
         if not targets:

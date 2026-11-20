@@ -248,7 +248,7 @@ All 53 tools are listed below with their parameters and descriptions (55 with th
 | `portainer_services_list(endpoint_id?, stack_filter?)` | `docker service ls`: every service with stack, image (tag and digest separated), mode, **running/desired** replicas, published ports and update status. |
 | `portainer_service_inspect(service_id, reveal_env?, endpoint_id?)` | Full service definition (spec, previous spec, update status). Credential-looking `Env` values are masked unless `reveal_env=true`. |
 | `portainer_service_tasks(service_id, limit?, endpoint_id?)` | `docker service ps`: tasks by slot with state, node hostname, container id and the scheduler / start **error** — the first place to look when replicas won't come up. |
-| `portainer_service_logs(service_id, tail?, since?, timestamps?, endpoint_id?)` | Aggregated logs of all the service's tasks across nodes. |
+| `portainer_service_logs(service_id, tail?, since?, timestamps?, endpoint_id?, until?, max_matches?, max_bytes?)` | Aggregated task logs across nodes. Use `since` with `until` or an explicit window limit to return the latest lines in the window. |
 | `portainer_service_update(service_id, image?, replicas?, force_restart?, registry_id?, endpoint_id?)` | `docker service update`: change the image, scale, or `--force` a restart (reads the current spec + version, submits it back). Pass `image` without a digest to make Swarm resolve the tag's current digest; `force_restart` alone re-creates tasks with the pinned digest. Portainer's stored registry credentials are used automatically when the image host matches a configured registry (or pass `registry_id`). |
 | `portainer_service_rollback(service_id, endpoint_id?)` | `docker service rollback`: revert to the previous spec (requires a prior update). |
 | `portainer_service_wait(service_id, timeout_seconds?, endpoint_id?)` | Poll until the service is healthy and its update finished, the update paused on failure, or the timeout elapses. Returns the service summary with `converged` / `reason` and recent task errors. |
@@ -267,17 +267,43 @@ All 53 tools are listed below with their parameters and descriptions (55 with th
 | `portainer_container_restart(container_id, endpoint_id?)` | Restart a container. |
 | `portainer_container_remove(container_id, force?, endpoint_id?)` | Remove a container. `force` defaults to false. |
 | `portainer_container_logs(container_id, tail?, since?, timestamps?, endpoint_id?)` | Get container logs as a JSON envelope (`logs`, `truncated`, `total_chars`). `tail` defaults to 100 (max 1000). `since` accepts a duration (`10m`, `2h`, `1d`), a Unix timestamp or an ISO-8601 datetime; `timestamps=true` prefixes each line. |
-| `portainer_container_logs_grep(container_id, pattern, tail?, context_lines?, since?, timestamps?, endpoint_id?)` | Server-side regex over logs. Returns only matching lines (with optional context) — saves bandwidth on noisy logs. |
+| `portainer_container_logs_grep(container_id, pattern, tail?, context_lines?, since?, timestamps?, endpoint_id?, until?, max_matches?, max_bytes?)` | Regex search with optional context. Pass `since` to scan beyond the tail. |
 | `portainer_container_stats(container_id, endpoint_id?)` | Point-in-time CPU%, memory, network and block I/O stats (not a stream). |
 | `portainer_container_exec(container_id, command, workdir?, user?, endpoint_id?)` | Run a shell command inside a running container and return its stdout/stderr + exit code. Audit-logged. |
-| `portainer_stack_logs_errors(stack_name, tail?, endpoint_id?)` | Concurrent scan of every running container in a stack for HTTP 4xx/5xx, exceptions, fatal/critical levels, panics, OOM, PHP errors, etc. |
+| `portainer_stack_logs_errors(stack_name, tail?, endpoint_id?, since?, until?, max_matches?, max_bytes?)` | Scan running containers for HTTP 4xx/5xx, exceptions, panics, OOM, and other error patterns. Window results report coverage by service. |
+
+For `container_logs_grep` and `stack_logs_errors`, `since` enables a streamed
+window. `service_logs` keeps its tail mode with `since` alone. Its window mode
+requires `since` plus `until`, `max_matches`, or `max_bytes`, and returns the
+latest lines in timestamp order. `until` defaults to the time of the call.
+Both bounds accept durations, 9–10 digit Unix seconds, or ISO-8601 timestamps.
+Window responses show the resolved bounds as Unix seconds. Docker applies both
+bounds to container requests. For aggregated Swarm logs, Docker applies `since`
+and the MCP server applies `until`, so bytes outside the window still count.
+
+Window scans return `lines_scanned`, observed `first_ts` and `last_ts`, and
+`returned_first_ts` and `returned_last_ts` for the retained output. `max_bytes`
+defaults to 32 MiB and is shared by replicas of one service in a stack scan.
+`max_matches` defaults to 200 and is capped at 1000 across the response. The
+scan continues after reaching the match limit to report coverage.
+`truncation_reason` can be `matches_limit` for omitted output, `bytes_limit`
+for a byte cutoff, or `regex_timeout` for a `grep` scan stopped between batches.
 
 ### Laravel (opt-in: `PORTAINER_ENABLE_LARAVEL_TOOLS=true`)
 
 | Tool | Description |
 |---|---|
-| `portainer_laravel_errors(stack_name, tail?, endpoint_id?)` | Read `/var/www/app/storage/logs/laravel.log` inside each container of a stack and return `production.ERROR/CRITICAL/EMERGENCY` entries — the actual exception behind a 500. |
+| `portainer_laravel_errors(stack_name, tail?, endpoint_id?, since?, until?, max_groups?, max_bytes?, timezone?)` | With `since`, group Laravel exceptions by class and file:line from Docker stderr and the current `/var/www/app/storage/logs/laravel.log`. Reports coverage per container and source. Without `since`, return the file's recent `production.ERROR/CRITICAL/EMERGENCY` entries. |
 | `portainer_laravel_tinker(stack_name, code, endpoint_id?)` | Execute PHP via `php artisan tinker --execute=...` in the first running `{stack}_backend` container (Swarm, plain-Compose and Compose-v1 naming all matched). Code capped at 4096 chars. Audit-logged. |
+
+Laravel's window scan includes running containers and uses merged Docker logs
+for TTY containers. The file source reads its latest `max_bytes` and reports
+the first complete record as `read_from_ts`. The source is partial when the
+file tail cuts into the requested window. File timestamps without an offset
+use the container's current UTC offset, reported as `timezone_offset`. Pass
+`timezone` to override it with an IANA name or UTC offset. `count_by_source`
+shows `stderr` and `file` counts. File entries shared across replicas are counted
+once, with repeated entries within a file preserved.
 
 ### Images
 
