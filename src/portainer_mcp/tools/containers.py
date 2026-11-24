@@ -26,6 +26,7 @@ from .logs import (
     _DEFAULT_LOG_BYTES,
     _DEFAULT_LOG_MATCHES,
     _MAX_LOG_CHARS,
+    _clamp_bytes,
     _docker_window_lines,
     _LogCoverage,
     _LogMatches,
@@ -81,8 +82,7 @@ _ERROR_LINE_RE = re.compile(
 def _validate_container_id(container_id: str) -> None:
     if not _CONTAINER_ID_RE.match(container_id):
         raise ValueError(
-            f"Invalid container_id: {container_id!r}. "
-            "Must be alphanumeric with _ . - only"
+            f"Invalid container_id: {container_id!r}. Must be alphanumeric with _ . - only"
         )
 
 
@@ -140,7 +140,8 @@ def _parse_docker_stream(raw: bytes) -> str:
             # truncation): decode the partial payload best-effort.
             logger.debug(
                 "Docker stream truncated frame: need %d bytes, have %d",
-                size, n - i,
+                size,
+                n - i,
             )
             lines.append(raw[i:].decode("utf-8", errors="replace"))
             break
@@ -171,10 +172,7 @@ def _stack_targets(
                 matched = (
                     name == base
                     or name.startswith(base + ".")
-                    or (
-                        name.startswith(base + "_")
-                        and name[len(base) + 1 :].isdigit()
-                    )
+                    or (name.startswith(base + "_") and name[len(base) + 1 :].isdigit())
                 )
             else:
                 matched = name.startswith(base)
@@ -239,18 +237,31 @@ async def _grep_indices(regex: re.Pattern[str], lines: list[str], timeout: float
 
 
 async def _grep_window(
-    client: PortainerClient, path: str, coverage: _LogCoverage, timeout: float,
-    regex: re.Pattern[str], context_lines: int, timestamps: bool, max_matches: int,
+    client: PortainerClient,
+    path: str,
+    coverage: _LogCoverage,
+    timeout: float,
+    regex: re.Pattern[str],
+    context_lines: int,
+    timestamps: bool,
+    max_matches: int,
 ) -> _LogMatches:
     matches = _LogMatches(_match_budget(max_matches))
+    regex_remaining = _GREP_SCAN_TIMEOUT
     previous: deque[tuple[int, str, int, str]] = deque(maxlen=context_lines)
     position = 0
     last_output = -1
     context_end = -1
 
     async def scan(batch: list[tuple[str, int, str]]) -> None:
-        nonlocal position, last_output, context_end
-        hits = set(await _grep_indices(regex, [row[0] for row in batch], _GREP_SCAN_TIMEOUT))
+        nonlocal position, last_output, context_end, regex_remaining
+        if regex_remaining <= 0:
+            raise _GrepTimeout
+        # Docker reads have their own deadline. Spend this budget on searches,
+        # including the final batch buffered before a stream cutoff.
+        started = time.monotonic()
+        hits = set(await _grep_indices(regex, [row[0] for row in batch], regex_remaining))
+        regex_remaining -= time.monotonic() - started
         for index, (line, ns, stamp) in enumerate(batch):
             coverage.scan(ns, stamp)
             if index in hits:
@@ -279,19 +290,37 @@ async def _grep_window(
             coverage.returned(ns, stamp)
 
     batch: list[tuple[str, int, str]] = []
+    failure: Exception | None = None
     try:
-        async with aclosing(_docker_window_lines(
-            client, path, coverage, timeout, timestamps=timestamps, track_coverage=False,
-        )) as lines:
-            async for _, text, ns, stamp in lines:
-                batch.append((text, ns, stamp))
-                if len(batch) == 128:
-                    await scan(batch)
-                    batch.clear()
-            if batch:
-                await scan(batch)
+        try:
+            async with aclosing(
+                _docker_window_lines(
+                    client,
+                    path,
+                    coverage,
+                    timeout,
+                    timestamps=timestamps,
+                    track_coverage=False,
+                )
+            ) as lines:
+                async for _, text, ns, stamp in lines:
+                    batch.append((text, ns, stamp))
+                    if len(batch) == 128:
+                        await scan(batch)
+                        batch.clear()
+        except (httpx.HTTPError, PortainerResponseError) as exc:
+            failure = exc
+        if batch:
+            await scan(batch)
     except _GrepTimeout:
-        coverage.stop_reason = "regex_timeout"
+        if coverage.stop_reason is None:
+            coverage.stop_reason = "regex_timeout"
+    if failure is not None:
+        # A stream that broke before delivering anything is an error (wrong
+        # container, no access). One that broke later keeps what was read.
+        if coverage.lines_scanned == 0:
+            raise failure
+        coverage.fail(failure)
     return matches
 
 
@@ -303,7 +332,8 @@ class _WindowTarget(NamedTuple):
 
 
 def _window_stack_targets(
-    containers: list[dict[str, Any]] | None, stack_name: str,
+    containers: list[dict[str, Any]] | None,
+    stack_name: str,
 ) -> list[_WindowTarget]:
     targets = []
     for container in containers or []:
@@ -328,8 +358,16 @@ def _window_stack_targets(
 
 
 async def _stack_log_window(
-    client: PortainerClient, eid: int, stack_name: str, targets: list[_WindowTarget],
-    window: _LogWindow, timeout: float, max_matches: int, max_bytes: int,
+    client: PortainerClient,
+    eid: int,
+    stack_name: str,
+    targets: list[_WindowTarget],
+    window: _LogWindow,
+    timeout: float,
+    max_matches: int,
+    max_bytes: int,
+    *,
+    deadline: float,
 ) -> str:
     services: dict[str, list[_WindowTarget]] = {}
     for target in targets[:_MAX_STACK_TARGETS]:
@@ -337,46 +375,67 @@ async def _stack_log_window(
 
     budget = _match_budget(max_matches)
     sem = asyncio.Semaphore(_STACK_FANOUT_LIMIT)
-    combined = _LogCoverage(window, max_bytes)
+    combined = _LogCoverage(window, max_bytes, deadline=deadline)
 
     async def scan(replicas: list[_WindowTarget]) -> dict[str, Any]:
-        coverage = _LogCoverage(window, max_bytes)
+        coverage = _LogCoverage(window, max_bytes, deadline=deadline)
         matches = _LogMatches(budget)
-        failed = []
+        failed: list[str] = []
+        failure_reasons: dict[str, str] = {}
+        clipped = 0
         scanned = 0
         attempted = 0
         async with sem:
             for target in replicas:
+                if time.monotonic() >= deadline:
+                    coverage.stop_reason = "time_limit"
+                    break
                 attempted += 1
                 path = f"/api/endpoints/{eid}/docker/containers/{quote(target.id, safe='')}/logs"
                 try:
-                    async with aclosing(_docker_window_lines(
-                        client, path, coverage, timeout, headers=target.headers,
-                    )) as lines:
+                    async with aclosing(
+                        _docker_window_lines(
+                            client,
+                            path,
+                            coverage,
+                            timeout,
+                            headers=target.headers,
+                        )
+                    ) as lines:
                         async for _, text, ns, stamp in lines:
                             if _ERROR_LINE_RE.search(text):
+                                before = budget.clipped
                                 kept = matches.match(text)
                                 if kept is not None:
+                                    clipped += budget.clipped - before
                                     matches.lines.append(kept)
                                     coverage.returned(ns, stamp)
                     scanned += 1
-                except (httpx.HTTPError, PortainerResponseError) as exc:
+                except Exception as exc:
+                    reason = redact_secrets(str(exc))[:300] or type(exc).__name__
                     failed.append(target.name)
-                    logger.warning("Failed to read logs for %s: %s", target.name, exc)
-                if coverage.bytes_limited:
+                    failure_reasons[target.name] = reason
+                    logger.warning("Failed to read logs for %s: %s", target.name, reason)
+                if coverage.bytes_limited or coverage.stop_reason is not None:
                     break
         combined.include(coverage)
         return {
-            **coverage.summary(matches.limited), "errors_found": matches.found,
-            "errors": matches.lines, "containers_scanned": scanned,
-            "containers_failed": failed, "containers_skipped": len(replicas) - attempted,
+            **coverage.summary(matches.limited, clipped),
+            "errors_found": matches.found,
+            "errors": matches.lines,
+            "containers_scanned": scanned,
+            "containers_failed": failed,
+            "containers_skipped": len(replicas) - attempted,
+            "failure_reasons": failure_reasons,
         }
 
     scans = await asyncio.gather(*(scan(replicas) for replicas in services.values()))
     results = dict(zip(services, scans, strict=True))
     matches_limited = any(r["truncation_reason"] == "matches_limit" for r in scans)
     body = {
-        "stack": stack_name, **window.bounds(), **combined.summary(matches_limited),
+        "stack": stack_name,
+        **window.bounds(),
+        **combined.summary(matches_limited, budget.clipped),
         "total_errors": sum(r["errors_found"] for r in results.values()),
         "containers_omitted": max(0, len(targets) - _MAX_STACK_TARGETS),
         "services": results,
@@ -428,16 +487,18 @@ def register(mcp: FastMCP) -> None:
             stack, service = _container_labels(c)
             if stack_filter is not None and stack != stack_filter:
                 continue
-            result.append({
-                "id": c["Id"][:12],
-                "names": c.get("Names", []),
-                "image": c.get("Image"),
-                "state": c.get("State"),
-                "status": c.get("Status"),
-                "created": c.get("Created"),
-                "stack": stack,
-                "service": service,
-            })
+            result.append(
+                {
+                    "id": c["Id"][:12],
+                    "names": c.get("Names", []),
+                    "image": c.get("Image"),
+                    "state": c.get("State"),
+                    "status": c.get("Status"),
+                    "created": c.get("Created"),
+                    "stack": stack,
+                    "service": service,
+                }
+            )
         return json.dumps(result, indent=2, ensure_ascii=False)
 
     @mcp.tool()
@@ -483,7 +544,8 @@ def register(mcp: FastMCP) -> None:
         )
         return json.dumps(
             {"status": "started", "container_id": container_id},
-            indent=2, ensure_ascii=False,
+            indent=2,
+            ensure_ascii=False,
         )
 
     @mcp.tool()
@@ -508,7 +570,8 @@ def register(mcp: FastMCP) -> None:
         )
         return json.dumps(
             {"status": "stopped", "container_id": container_id},
-            indent=2, ensure_ascii=False,
+            indent=2,
+            ensure_ascii=False,
         )
 
     @mcp.tool()
@@ -533,7 +596,8 @@ def register(mcp: FastMCP) -> None:
         )
         return json.dumps(
             {"status": "restarted", "container_id": container_id},
-            indent=2, ensure_ascii=False,
+            indent=2,
+            ensure_ascii=False,
         )
 
     @mcp.tool()
@@ -556,7 +620,9 @@ def register(mcp: FastMCP) -> None:
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         logger.info(
             "AUDIT: Removing container %s (force=%s) on endpoint %d",
-            container_id, force, eid,
+            container_id,
+            force,
+            eid,
         )
         await client.delete(
             f"/api/endpoints/{eid}/docker/containers/{container_id}",
@@ -564,7 +630,8 @@ def register(mcp: FastMCP) -> None:
         )
         return json.dumps(
             {"status": "removed", "container_id": container_id},
-            indent=2, ensure_ascii=False,
+            indent=2,
+            ensure_ascii=False,
         )
 
     @mcp.tool()
@@ -647,16 +714,14 @@ def register(mcp: FastMCP) -> None:
             endpoint_id: Target endpoint ID (uses default if omitted)
             until: End of the window, same formats as since (default: now)
             max_matches: Window matches to return (default 200, max 1000)
-            max_bytes: Window Docker response byte limit (default 32 MiB)
+            max_bytes: Window Docker response byte limit (default 32 MiB, max 1 GiB)
         """
         _validate_container_id(container_id)
         tail = max(1, min(tail, 1000))
         context_lines = max(0, min(context_lines, 5))
         window = _LogWindow.parse(since, until)
         if len(pattern) > _MAX_GREP_PATTERN_CHARS:
-            raise ValueError(
-                f"Regex pattern too long (max {_MAX_GREP_PATTERN_CHARS} chars)"
-            )
+            raise ValueError(f"Regex pattern too long (max {_MAX_GREP_PATTERN_CHARS} chars)")
         try:
             regex = re.compile(pattern, re.IGNORECASE)
         except re.error as exc:
@@ -667,19 +732,37 @@ def register(mcp: FastMCP) -> None:
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         path = f"/api/endpoints/{eid}/docker/containers/{quote(container_id, safe='')}/logs"
         if window is not None:
-            coverage = _LogCoverage(window, max(1, max_bytes))
-            matches = await _grep_window(
-                client, path, coverage, config.long_timeout, regex, context_lines,
-                timestamps, max_matches,
+            coverage = _LogCoverage(
+                window,
+                _clamp_bytes(max_bytes),
+                deadline=time.monotonic() + config.long_timeout,
             )
-            return json.dumps({
-                "container_id": container_id, "pattern": pattern, **window.bounds(),
-                **coverage.summary(matches.limited), "matches_found": matches.found,
-                "lines": matches.lines,
-            }, indent=2, ensure_ascii=False)
+            matches = await _grep_window(
+                client,
+                path,
+                coverage,
+                config.long_timeout,
+                regex,
+                context_lines,
+                timestamps,
+                max_matches,
+            )
+            return json.dumps(
+                {
+                    "container_id": container_id,
+                    "pattern": pattern,
+                    **window.bounds(),
+                    **coverage.summary(matches.limited, matches.budget.clipped),
+                    "matches_found": matches.found,
+                    "lines": matches.lines,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
 
         resp = await client.request(
-            "GET", path,
+            "GET",
+            path,
             params=_log_params(tail, since, timestamps),
             timeout=config.long_timeout,
         )
@@ -740,7 +823,7 @@ def register(mcp: FastMCP) -> None:
             since: Start of window: duration, Unix seconds or ISO-8601 datetime
             until: End of the window, same formats as since (default: now)
             max_matches: Window matches to return across the stack (default 200, max 1000)
-            max_bytes: Window Docker response byte limit per service (default 32 MiB)
+            max_bytes: Window Docker response byte limit per service (default 32 MiB, max 1 GiB)
         """
         if not _STACK_NAME_RE.match(stack_name):
             raise ValueError(f"Invalid stack_name: {stack_name!r}")
@@ -751,29 +834,43 @@ def register(mcp: FastMCP) -> None:
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
 
+        deadline = time.monotonic() + config.long_timeout
         containers = await client.get(
             f"/api/endpoints/{eid}/docker/containers/json",
             params={"all": "false"},
         )
         if window is not None:
             return await _stack_log_window(
-                client, eid, stack_name, _window_stack_targets(containers, stack_name),
-                window, config.long_timeout, max_matches, max(1, max_bytes),
+                client,
+                eid,
+                stack_name,
+                _window_stack_targets(containers, stack_name),
+                window,
+                config.long_timeout,
+                max_matches,
+                _clamp_bytes(max_bytes),
+                deadline=deadline,
             )
         targets = _stack_targets(containers, stack_name)
 
         if not targets:
-            return json.dumps({
-                "stack": stack_name,
-                "containers_scanned": 0,
-                "total_errors": 0,
-                "message": f"No running containers found for stack '{stack_name}'",
-            }, indent=2, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "stack": stack_name,
+                    "containers_scanned": 0,
+                    "total_errors": 0,
+                    "message": f"No running containers found for stack '{stack_name}'",
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
 
         if len(targets) > _MAX_STACK_TARGETS:
             logger.warning(
                 "Stack %r has %d containers; scanning only the first %d",
-                stack_name, len(targets), _MAX_STACK_TARGETS,
+                stack_name,
+                len(targets),
+                _MAX_STACK_TARGETS,
             )
             targets = targets[:_MAX_STACK_TARGETS]
 
@@ -865,13 +962,11 @@ def register(mcp: FastMCP) -> None:
         # CPU usage calculation
         cpu_stats = s.get("cpu_stats", {})
         precpu_stats = s.get("precpu_stats", {})
-        cpu_delta = (
-            cpu_stats.get("cpu_usage", {}).get("total_usage", 0)
-            - precpu_stats.get("cpu_usage", {}).get("total_usage", 0)
-        )
-        system_delta = (
-            cpu_stats.get("system_cpu_usage", 0)
-            - precpu_stats.get("system_cpu_usage", 0)
+        cpu_delta = cpu_stats.get("cpu_usage", {}).get("total_usage", 0) - precpu_stats.get(
+            "cpu_usage", {}
+        ).get("total_usage", 0)
+        system_delta = cpu_stats.get("system_cpu_usage", 0) - precpu_stats.get(
+            "system_cpu_usage", 0
         )
         # Docker's canonical fallback chain: some daemons report
         # online_cpus: 0 explicitly (cgroup v1), others omit it entirely.
@@ -903,18 +998,22 @@ def register(mcp: FastMCP) -> None:
         def _mb(b: int) -> float:
             return round(b / 1_048_576, 1)
 
-        return json.dumps({
-            "cpu_percent": cpu_percent,
-            "online_cpus": online_cpus,
-            "memory_usage_mb": _mb(mem_usage),
-            "memory_limit_mb": _mb(mem_limit),
-            "memory_percent": mem_percent,
-            "network_rx_mb": _mb(net_rx),
-            "network_tx_mb": _mb(net_tx),
-            "block_read_mb": _mb(blk_read),
-            "block_write_mb": _mb(blk_write),
-            "pids": s.get("pids_stats", {}).get("current", 0),
-        }, indent=2, ensure_ascii=False)
+        return json.dumps(
+            {
+                "cpu_percent": cpu_percent,
+                "online_cpus": online_cpus,
+                "memory_usage_mb": _mb(mem_usage),
+                "memory_limit_mb": _mb(mem_limit),
+                "memory_percent": mem_percent,
+                "network_rx_mb": _mb(net_rx),
+                "network_tx_mb": _mb(net_tx),
+                "block_read_mb": _mb(blk_read),
+                "block_write_mb": _mb(blk_write),
+                "pids": s.get("pids_stats", {}).get("current", 0),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
 
     @mcp.tool()
     @tool_error_handler
@@ -944,7 +1043,9 @@ def register(mcp: FastMCP) -> None:
         # split across the cut can never land in the log half-masked.
         logger.info(
             "AUDIT: Exec in container %s on endpoint %d: %s",
-            container_id, eid, redact_secrets(command)[:500],
+            container_id,
+            eid,
+            redact_secrets(command)[:500],
         )
 
         # Step 1: Create exec instance
@@ -984,7 +1085,11 @@ def register(mcp: FastMCP) -> None:
         if len(output) > _MAX_LOG_CHARS:
             output = output[:_MAX_LOG_CHARS] + f"\n... truncated ({len(output)} total chars)"
 
-        return json.dumps({
-            "exit_code": exit_code,
-            "output": output,
-        }, indent=2, ensure_ascii=False)
+        return json.dumps(
+            {
+                "exit_code": exit_code,
+                "output": output,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )

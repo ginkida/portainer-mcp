@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import subprocess
+import time
 from collections.abc import AsyncIterator, Callable, Iterable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import httpcore
 import httpx
 import pytest
 from mcp.server.fastmcp import FastMCP
 
 import portainer_mcp.client as client_mod
+from portainer_mcp.config import get_config
 from portainer_mcp.server import create_server
+from portainer_mcp.tools import containers, logs, swarm
 
 _TS = "2026-09-07T10:00:00.500000001Z"
 _SINCE = "2026-09-07T10:00:00.5Z"
@@ -33,6 +39,21 @@ class _Stream(httpx.AsyncByteStream):
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class _StalledStream(_Stream):
+    def __init__(self, *chunks: bytes) -> None:
+        super().__init__(chunks)
+        self.read_cancelled = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in super().__aiter__():
+            yield chunk
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.read_cancelled = True
+            raise
 
 
 def _frame(data: bytes, stream: int = 1) -> bytes:
@@ -101,6 +122,7 @@ async def test_grep_scans_window_beyond_1000_lines(http: _MockPortainer) -> None
     assert body["first_ts"] == body["last_ts"] == _TS
     assert body["truncated"] is False
     assert body["truncation_reason"] is None
+    assert "stream_error" not in body
     assert http.requests[0].url.params == httpx.QueryParams(
         {
             "stdout": "true",
@@ -108,7 +130,7 @@ async def test_grep_scans_window_beyond_1000_lines(http: _MockPortainer) -> None
             "tail": "all",
             "timestamps": "true",
             "since": "1788775200.5",
-            "until": "1788775201",
+            "until": "1788775202",
         }
     )
     assert stream.closed
@@ -152,8 +174,41 @@ async def test_swarm_filters_until_across_out_of_order_frames(http: _MockPortain
     assert body["lines_scanned"] == 2
     assert body["first_ts"] == _TS
     assert body["last_ts"] == last
+    assert "stream_error" not in body
     assert http.requests[0].url.params["since"] == "1788775200"
     assert "until" not in http.requests[0].url.params
+
+
+async def test_container_until_padding_preserves_out_of_order_records(
+    http: _MockPortainer,
+) -> None:
+    records = [
+        (1_788_775_201, _line("outside", _UNTIL)),
+        (1_788_775_200, _line("inside", "2026-09-07T10:00:00.899999999Z")),
+    ]
+
+    def docker(request: httpx.Request) -> httpx.Response:
+        # The json-file reader stops at the first record newer than until.
+        cutoff = float(request.url.params["until"])
+        chunks = []
+        for second, record in records:
+            if second > cutoff:
+                break
+            chunks.append(_frame(record))
+        return httpx.Response(200, stream=_Stream(chunks))
+
+    http.replies["/containers/app/logs"] = docker
+    body = await _call(
+        create_server(enable_laravel_tools=False),
+        "container_logs_grep",
+        container_id="app",
+        pattern=".",
+        since=_SINCE,
+        until="2026-09-07T10:00:00.9Z",
+    )
+    assert http.requests[0].url.params["until"] == "1788775202"
+    assert body["until"] == "1788775200.9"
+    assert body["lines"] == ["inside"]
 
 
 @pytest.mark.parametrize(("max_matches", "expected"), [(None, 200), (5_000, 1_000), (0, 1)])
@@ -317,6 +372,388 @@ def _container(cid: str, service: str) -> dict[str, Any]:
     }
 
 
+_WINDOW_TOOLS = [
+    ("container_logs_grep", {"container_id": "app", "pattern": "ERROR"}, "/containers/app/logs"),
+    ("stack_logs_errors", {"stack_name": "demo"}, "/containers/app/logs"),
+    ("service_logs", {"service_id": "web"}, "/services/web/logs"),
+]
+
+
+@pytest.mark.parametrize(("tool", "args", "path"), _WINDOW_TOOLS, ids=["grep", "stack", "service"])
+async def test_window_idle_timeout_keeps_lines_and_closes_stream(
+    http: _MockPortainer,
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    args: dict[str, str],
+    path: str,
+) -> None:
+    monkeypatch.setattr(logs, "_STREAM_IDLE_SECONDS", 0.005)
+    http.replies["/containers/json"] = httpx.Response(
+        200, json=[_container("app", "web"), _container("other", "worker")]
+    )
+    healthy = http.stream("/containers/other/logs", _line("ERROR healthy service"))
+    stalled = _StalledStream(_frame(_line("ERROR before stall")))
+    http.replies[path] = httpx.Response(200, stream=stalled)
+
+    body = await asyncio.wait_for(
+        _call(create_server(enable_laravel_tools=False), tool, **args, since=_SINCE, until=_UNTIL),
+        timeout=1.0,
+    )
+
+    assert "error" not in body and "stream_error" not in body
+    assert body["truncated"] is True and body["truncation_reason"] == "idle_timeout"
+    if tool == "stack_logs_errors":
+        web, worker = (body["services"][name] for name in ("web", "worker"))
+        assert web["errors"] == ["ERROR before stall"]
+        assert web["truncated"] is True and web["truncation_reason"] == "idle_timeout"
+        assert web["containers_failed"] == []
+        assert worker["errors"] == ["ERROR healthy service"]
+        assert worker["truncated"] is False and worker["truncation_reason"] is None
+        assert healthy.closed and healthy.reads == 1
+    elif tool == "service_logs":
+        assert body["logs"] == "ERROR before stall\n"
+    else:
+        assert body["lines"] == ["ERROR before stall"]
+    assert stalled.reads == 1 and stalled.read_cancelled and stalled.closed
+
+
+async def test_window_silent_stream_waits_for_call_deadline(
+    http: _MockPortainer, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 50.0
+    clock = SimpleNamespace(time_ns=time.time_ns, monotonic=lambda: now)
+    monkeypatch.setattr(logs, "time", clock)
+    monkeypatch.setattr(swarm, "time", clock)
+    monkeypatch.setattr(logs, "_STREAM_IDLE_SECONDS", 0.001)
+    stalled = _StalledStream()
+
+    def open_stream(_: httpx.Request) -> httpx.Response:
+        nonlocal now
+        # Leave 20 ms on the call deadline, longer than the idle threshold.
+        now += get_config().long_timeout - 0.020
+        return httpx.Response(200, stream=stalled)
+
+    http.replies["/services/web/logs"] = open_stream
+    body = await asyncio.wait_for(
+        _call(
+            create_server(enable_laravel_tools=False), "service_logs", service_id="web",
+            since=_SINCE, until=_UNTIL,
+        ),
+        timeout=1.0,
+    )
+
+    assert "error" not in body and "stream_error" not in body
+    assert body["logs"] == "" and body["lines_scanned"] == body["bytes_read"] == 0
+    assert body["truncated"] is True and body["truncation_reason"] == "time_limit"
+    assert stalled.read_cancelled and stalled.closed
+
+
+@pytest.mark.parametrize(("tool", "args", "path"), _WINDOW_TOOLS)
+async def test_window_byte_limit_clamps_to_one_gib(
+    http: _MockPortainer, monkeypatch: pytest.MonkeyPatch,
+    tool: str, args: dict[str, str], path: str,
+) -> None:
+    assert logs._MAX_LOG_BYTES == 1024**3
+    assert logs._clamp_bytes(10**30) == 1024**3
+    assert logs._clamp_bytes(-10**30) == 1
+    monkeypatch.setattr(logs, "_MAX_LOG_BYTES", 100)
+    http.replies["/containers/json"] = httpx.Response(200, json=[_container("app", "web")])
+    first = _frame(_line("ERROR keep"))
+    http.stream(path, first, _frame(_line("ERROR " + "x" * 100)))
+    body = await _call(
+        create_server(enable_laravel_tools=False), tool, **args, since=_SINCE, max_bytes=10**30,
+    )
+    assert body["bytes_read"] == 100
+    assert body["truncated"] is True and body["truncation_reason"] == "bytes_limit"
+    assert body["lines_scanned"] == 1
+
+
+@pytest.mark.parametrize(("tool", "args", "path"), _WINDOW_TOOLS)
+async def test_window_deadline_keeps_lines_before_late_chunk(
+    http: _MockPortainer, monkeypatch: pytest.MonkeyPatch,
+    tool: str, args: dict[str, str], path: str,
+) -> None:
+    now = 50.0
+    clock = SimpleNamespace(time_ns=time.time_ns, monotonic=lambda: now)
+    for module in (logs, containers, swarm):
+        monkeypatch.setattr(module, "time", clock)
+    monkeypatch.setattr(containers, "_STACK_FANOUT_LIMIT", 1)
+    http.replies["/containers/json"] = httpx.Response(
+        200, json=[_container("app", "web"), _container("late", "worker")],
+    )
+    http.stream("/containers/late/logs", _line("ERROR skipped service"))
+
+    def chunks() -> Iterable[bytes]:
+        nonlocal now
+        yield _line("ERROR first") + _line("ERROR partial")[:-1]
+        now += 301
+        yield b"\n" + _line("ERROR late")
+        yield _line("ERROR unread")
+
+    stream = _Stream(chunks())
+    http.replies[path] = httpx.Response(200, stream=stream)
+    body = await _call(
+        create_server(enable_laravel_tools=False), tool, **args, since=_SINCE, until=_UNTIL,
+    )
+    assert body["truncated"] is True and body["truncation_reason"] == "time_limit"
+    assert body["lines_scanned"] == 1
+    if tool == "stack_logs_errors":
+        assert body["services"]["web"]["errors"] == ["ERROR first"]
+        assert body["services"]["web"]["truncation_reason"] == "time_limit"
+        assert body["services"]["worker"]["truncation_reason"] == "time_limit"
+        assert body["services"]["worker"]["containers_skipped"] == 1
+        assert len(http.requests) == 2
+    elif tool == "service_logs":
+        assert body["logs"] == "ERROR first\n"
+    else:
+        assert body["lines"] == ["ERROR first"]
+    assert stream.closed and stream.reads == 2
+
+
+@pytest.mark.parametrize(("tool", "args", "path"), _WINDOW_TOOLS)
+@pytest.mark.parametrize("reason", ["line_clipped", "bytes_limit", "matches_limit"])
+async def test_window_counts_clipped_returned_lines(
+    http: _MockPortainer, tool: str, args: dict[str, str], path: str, reason: str,
+) -> None:
+    http.replies["/containers/json"] = httpx.Response(200, json=[_container("app", "web")])
+    # Swarm keeps the newest match, so the first wire record has the later stamp.
+    long_line = _frame(_line("ERROR " + "x" * 11_994, _UNTIL))
+    short_line = _frame(_line("ERROR second"))
+    http.stream(path, long_line, *([short_line] if reason != "line_clipped" else []))
+    body = await _call(
+        create_server(enable_laravel_tools=False), tool, **args,
+        since=_SINCE, until=_UNTIL, max_matches=1,
+        max_bytes=len(long_line) + (1 if reason == "bytes_limit" else len(short_line)),
+    )
+    assert body["lines_clipped"] == 1
+    assert body["truncated"] is True
+    assert body["truncation_reason"] == reason
+    assert body["lines_scanned"] == (2 if reason == "matches_limit" else 1)
+    if tool == "stack_logs_errors":
+        assert body["services"]["web"]["lines_clipped"] == 1
+        assert body["services"]["web"]["truncation_reason"] == reason
+        (output,) = body["services"]["web"]["errors"]
+    elif tool == "service_logs":
+        (output,) = body["logs"].splitlines()
+    else:
+        (output,) = body["lines"]
+    assert len(output) == 10_000 + len("... (truncated)")
+    assert output.endswith("... (truncated)")
+
+
+async def test_service_window_excludes_clipped_lines_dropped_from_output(
+    http: _MockPortainer,
+) -> None:
+    http.stream(
+        "/services/web/logs",
+        _frame(_line("x" * 12_000)),
+        _frame(_line("password=hunter2", _UNTIL)),
+    )
+    body = await _call(
+        create_server(enable_laravel_tools=False), "service_logs",
+        service_id="web", since=_SINCE, until=_UNTIL, max_matches=1,
+    )
+    assert body["logs"] == "[REDACTED]\n"
+    assert "hunter2" not in json.dumps(body)
+    assert body["lines_clipped"] == 0
+    assert body["truncated"] is True and body["truncation_reason"] == "matches_limit"
+
+
+@pytest.mark.parametrize("complete", [True, False])
+async def test_window_system_error_reports_redacted_message(
+    http: _MockPortainer, complete: bool,
+) -> None:
+    message = b"  corrupted Docker log \xff password=hunter2\n"
+    frame = _frame(message if complete else message + b"unavailable", 3)
+    if not complete:
+        frame = frame[:-len(b"unavailable")]
+    http.stream("/services/web/logs", _frame(_line("first")) + frame[:14], frame[14:])
+    body = await _call(
+        create_server(enable_laravel_tools=False), "service_logs",
+        service_id="web", since=_SINCE, until=_UNTIL,
+    )
+    assert "error" not in body
+    assert body["logs"] == "first\n" and body["lines_scanned"] == 1
+    assert body["truncated"] is True and body["truncation_reason"] == "stream_error"
+    assert body["stream_error"] == (
+        "Docker reported an error in its log stream: corrupted Docker log � [REDACTED]"
+    )
+
+
+_SINGLE_SOURCE_TOOLS = [_WINDOW_TOOLS[0], _WINDOW_TOOLS[2]]
+
+
+@pytest.mark.parametrize(("tool", "args", "path"), _SINGLE_SOURCE_TOOLS, ids=["grep", "service"])
+@pytest.mark.parametrize("failure", ["read-error", "system-frame"])
+@pytest.mark.parametrize("in_window", [True, False], ids=["scanned", "no-lines-scanned"])
+async def test_window_stream_failure_keeps_scanned_lines_or_returns_error(
+    http: _MockPortainer,
+    tool: str,
+    args: dict[str, str],
+    path: str,
+    failure: str,
+    in_window: bool,
+) -> None:
+    messages = ["context before", "ERROR keep", "context after"]
+    stamp = _TS if in_window else "2026-09-07T09:59:59Z"
+    cause = "log interrupted password=hunter2"
+
+    def chunks() -> Iterable[bytes]:
+        yield _frame(b"".join(_line(message, stamp) for message in messages))
+        if failure == "read-error":
+            raise httpx.ReadError(cause)
+        yield _frame(cause.encode(), 3)
+
+    stream = _Stream(chunks())
+    http.replies[path] = httpx.Response(200, stream=stream)
+    options = {"context_lines": 1} if tool == "container_logs_grep" else {}
+    body = await _call(
+        create_server(enable_laravel_tools=False), tool, **args, **options,
+        since=_SINCE, until=_UNTIL,
+    )
+
+    redacted = "log interrupted [REDACTED]"
+    if failure == "system-frame":
+        redacted = f"Docker reported an error in its log stream: {redacted}"
+    if in_window:
+        assert "error" not in body
+        assert body["lines_scanned"] == 3
+        assert body["truncated"] is True and body["truncation_reason"] == "stream_error"
+        assert body["stream_error"] == redacted
+        if tool == "container_logs_grep":
+            # Three records never fill a scan batch. Search the pending records and their context.
+            assert body["lines"] == messages and body["matches_found"] == 1
+        else:
+            assert body["logs"].splitlines() == messages
+    elif failure == "read-error":
+        assert body == {
+            "error": "Connection error",
+            "details": f"Cannot reach Portainer server: {redacted}",
+        }
+    else:
+        assert body == {"error": "Unexpected response from Portainer", "details": redacted}
+    assert stream.closed
+
+
+async def test_stack_system_error_keeps_other_replica_and_reports_reason(
+    http: _MockPortainer,
+) -> None:
+    http.replies["/containers/json"] = httpx.Response(
+        200, json=[_container("a", "web"), _container("b", "web")],
+    )
+    http.stream(
+        "/containers/a/logs", _frame(_line("ERROR before system error")),
+        _frame(b"incomplete log stream, node unavailable API_KEY=hunter2", 3),
+    )
+    http.stream("/containers/b/logs", _line("ERROR healthy replica"))
+    body = await _call(
+        create_server(enable_laravel_tools=False), "stack_logs_errors", stack_name="demo",
+        since=_SINCE,
+    )
+    web = body["services"]["web"]
+    assert web["errors"] == ["ERROR before system error", "ERROR healthy replica"]
+    assert web["containers_failed"] == ["demo-a-1"]
+    assert web["failure_reasons"] == {
+        "demo-a-1": "Docker reported an error in its log stream: "
+        "incomplete log stream, node unavailable [REDACTED]",
+    }
+
+
+async def test_stack_replica_read_error_preserves_matches(http: _MockPortainer) -> None:
+    http.replies["/containers/json"] = httpx.Response(200, json=[_container("app", "web")])
+
+    def chunks() -> Iterable[bytes]:
+        yield _line("ERROR first")
+        yield _line("ERROR second")
+        raise httpx.ReadError("disconnected password=hunter2 " + "x" * 400)
+
+    stream = _Stream(chunks())
+    http.replies["/containers/app/logs"] = httpx.Response(200, stream=stream)
+    body = await _call(
+        create_server(enable_laravel_tools=False), "stack_logs_errors", stack_name="demo",
+        since=_SINCE,
+    )
+    web = body["services"]["web"]
+    assert web["errors"] == ["ERROR first", "ERROR second"]
+    assert web["containers_failed"] == ["demo-app-1"]
+    assert web["failure_reasons"] == {"demo-app-1": ("disconnected [REDACTED] " + "x" * 400)[:300]}
+    assert body["total_errors"] == body["lines_scanned"] == 2
+    assert stream.closed
+
+
+async def test_stack_replica_value_error_keeps_other_service(http: _MockPortainer) -> None:
+    http.replies["/containers/json"] = httpx.Response(
+        200, json=[_container("a", "web"), _container("b", "worker")],
+    )
+
+    def fail(_: httpx.Request) -> httpx.Response:
+        raise ValueError()
+
+    http.replies["/containers/a/logs"] = fail
+    http.stream("/containers/b/logs", _line("ERROR healthy service"))
+    body = await _call(
+        create_server(enable_laravel_tools=False), "stack_logs_errors", stack_name="demo",
+        since=_SINCE,
+    )
+    assert body["services"]["web"]["containers_failed"] == ["demo-a-1"]
+    assert body["services"]["web"]["failure_reasons"] == {"demo-a-1": "ValueError"}
+    assert body["services"]["worker"]["errors"] == ["ERROR healthy service"]
+
+
+async def test_stack_replica_missing_timestamp_fails_source(http: _MockPortainer) -> None:
+    http.replies["/containers/json"] = httpx.Response(200, json=[_container("app", "web")])
+    http.stream("/containers/app/logs", _line("ERROR first"), b"ERROR missing timestamp\n")
+    body = await _call(
+        create_server(enable_laravel_tools=False), "stack_logs_errors", stack_name="demo",
+        since=_SINCE,
+    )
+    web = body["services"]["web"]
+    assert web["errors"] == ["ERROR first"]
+    assert web["containers_failed"] == ["demo-app-1"]
+    assert web["failure_reasons"] == {
+        "demo-app-1": "Docker returned a log line without a timestamp",
+    }
+
+
+async def test_grep_window_returns_final_line_without_newline(http: _MockPortainer) -> None:
+    http.stream("/containers/app/logs", _frame(_line("ERROR final")[:-1]))
+    body = await _call(
+        create_server(enable_laravel_tools=False), "container_logs_grep",
+        container_id="app", pattern="ERROR", since=_SINCE,
+    )
+    assert body["lines"] == ["ERROR final"]
+    assert body["lines_scanned"] == 1 and body["truncated"] is False
+
+
+def test_docker_decoder_caps_a_single_oversized_line() -> None:
+    decoder = logs._DockerLines()
+    chunk = b"x" * 100_000
+    assert list(decoder.feed(_frame(chunk))) == []
+    assert list(decoder.feed(_frame(chunk))) == []
+    [(stream, line)] = decoder.feed(_frame(chunk + b"\n"))
+    marker = " …[line truncated: 300000 bytes]"
+    assert stream == 1
+    assert len(line) == 100_000 + len(marker)
+    assert line == "x" * 100_000 + marker
+
+
+@pytest.mark.parametrize(("tool", "args", "_path"), _WINDOW_TOOLS[:2])
+@pytest.mark.parametrize(
+    ("since", "until", "details"),
+    [(None, _UNTIL, "until requires since"), (_SINCE, "bad", "Invalid until: 'bad'.")],
+)
+async def test_container_window_validates_until_before_http(
+    http: _MockPortainer, tool: str, args: dict[str, str], _path: str,
+    since: str | None, until: str, details: str,
+) -> None:
+    body = await _call(
+        create_server(enable_laravel_tools=False), tool, **args, since=since, until=until,
+    )
+    assert body["error"] == "Validation error"
+    assert body["details"].startswith(details)
+    assert http.requests == []
+
+
 async def test_stack_byte_budget_is_shared_by_replicas_and_reset_per_service(
     http: _MockPortainer,
 ) -> None:
@@ -358,7 +795,7 @@ async def test_stack_byte_budget_is_shared_by_replicas_and_reset_per_service(
         cid = request.url.path.split("/")[-2]
         assert request.headers["X-PortainerAgent-Target"] == f"node-{cid}"
         assert request.url.params["tail"] == "all"
-        assert request.url.params["until"] == "1788775201"
+        assert request.url.params["until"] == "1788775202"
 
 
 async def test_stack_match_limit_is_global_with_independent_coverage(http: _MockPortainer) -> None:
@@ -430,7 +867,8 @@ async def test_laravel_combines_stderr_and_file_and_reports_missing_sources(
             f"[2026-09-07 10:00:02] {first}\n"
         ).encode()
     )
-    info = _frame(b"PORTAINER_LARAVEL 1024 +0000\n")
+    # Size, mtime, inode, container offset, head checksum and length, optional header.
+    info = _frame(b"PORTAINER_LARAVEL 1024 1 42 +0000 77:256\n")
     http.stream("/exec/exec-app/start", info[:5], info[5:] + file_wire[:31], file_wire[31:])
     http.stream("/exec/exec-worker/start")
     body = await _call(
@@ -448,7 +886,8 @@ async def test_laravel_combines_stderr_and_file_and_reports_missing_sources(
             "count": 3,
             "count_by_source": {"stderr": 2, "file": 1},
             "first_ts": _TS,
-            "last_ts": last_time,
+            # Group stamps are normalised to UTC whichever source they came from.
+            "last_ts": "2026-09-07T10:00:00.8Z",
         },
         {
             "exception_class": r"App\OtherError",
@@ -479,7 +918,9 @@ async def test_laravel_reports_file_cutoff_independently_of_stderr(http: _MockPo
     http.stream("/containers/app/logs", _frame(_line("routine"), 2))
     http.replies["/containers/app/exec"] = httpx.Response(201, json={"Id": "exec-app"})
     http.replies["/exec/exec-app/json"] = httpx.Response(200, json={"ExitCode": 0})
-    wire = http.stream("/exec/exec-app/start", _frame(b"PORTAINER_LARAVEL 110 +0000\n" + b"x" * 64))
+    wire = http.stream(
+        "/exec/exec-app/start", _frame(b"PORTAINER_LARAVEL 110 1 42 +0000 77:110\n" + b"x" * 64)
+    )
     body = await _call(
         create_server(enable_laravel_tools=True),
         "laravel_errors",
@@ -620,6 +1061,67 @@ async def test_stream_auth_refresh_closes_rejected_body_before_retry() -> None:
         await client.close()
 
 
+@pytest.mark.parametrize(
+    "status", ["200 OK", "500 Internal Server Error"], ids=["logs", "rejected"]
+)
+async def test_cancellation_at_stream_eof_releases_pool_slot(
+    monkeypatch: pytest.MonkeyPatch, status: str,
+) -> None:
+    def response(status: str, body: bytes) -> bytes:
+        return f"HTTP/1.1 {status}\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+
+    closing = asyncio.Event()
+    release = asyncio.Event()
+
+    async def trace(event: str, _: dict[str, Any]) -> None:
+        # Pause before HTTP/1.1 releases the connection. A cancelled, unshielded
+        # close here leaves the pool's only connection marked busy.
+        if event == "http11.response_closed.started":
+            closing.set()
+            await release.wait()
+
+    async def attach_trace(request: httpx.Request) -> None:
+        if request.url.path.endswith("/logs"):
+            request.extensions["trace"] = trace
+
+    body = _frame(_line("first")) if status == "200 OK" else b"short rejected body"
+    backend = httpcore.AsyncMockBackend(
+        [response(status, body), response("200 OK", b'{"ok": true}')]
+    )
+    transport = httpx.AsyncHTTPTransport(limits=httpx.Limits(max_connections=1))
+    monkeypatch.setattr(transport._pool, "_network_backend", backend)
+    monkeypatch.setenv("PORTAINER_API_KEY", "test-api-key")
+    client = client_mod.PortainerClient()
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(
+        base_url="http://portainer.test",
+        transport=transport,
+        event_hooks={"request": [attach_trace]},
+    )
+    client_mod._client = client
+    task = asyncio.create_task(
+        _call(
+            create_server(enable_laravel_tools=False), "service_logs", service_id="web",
+            since=_SINCE, until=_UNTIL,
+        )
+    )
+    try:
+        await asyncio.wait_for(closing.wait(), timeout=1.0)
+        task.cancel()
+        await asyncio.sleep(0)  # Deliver cancellation while the close is paused.
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert await client.get("/api/status", timeout=0.01) == {"ok": True}
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await client.close()
+
+
 @pytest.mark.parametrize(("tail", "expected"), [(1, 1), (5_000, 1_000)])
 async def test_service_since_only_keeps_docker_tail_and_legacy_envelope(
     http: _MockPortainer,
@@ -685,27 +1187,33 @@ async def test_empty_stack_window_reports_no_running_containers(
     assert len(http.requests) == 1
 
 
-async def test_grep_regex_timeout_keeps_completed_batches_with_full_budget_each(
+async def test_grep_regex_timeout_keeps_completed_batches_with_one_budget(
     http: _MockPortainer,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from portainer_mcp.tools import containers
-
+    now = 50.0
     timeouts: list[float] = []
-    real_scan = containers._grep_indices
 
     async def scan(regex: re.Pattern[str], lines: list[str], timeout: float) -> list[int]:
+        nonlocal now
         timeouts.append(timeout)
-        return await real_scan(regex, lines, timeout if len(timeouts) == 1 else 0)
+        now += 2
+        if timeout < 2:
+            raise containers._GrepTimeout
+        return [index for index, line in enumerate(lines) if regex.search(line)]
 
+    clock = SimpleNamespace(time_ns=time.time_ns, monotonic=lambda: now)
+    monkeypatch.setattr(containers, "time", clock)
+    monkeypatch.setattr(logs, "time", clock)
     monkeypatch.setattr(containers, "_grep_indices", scan)
     first = "2026-09-07T10:00:00.600000000Z"
     second = "2026-09-07T10:00:00.900000000Z"
     wire = http.stream(
         "/containers/app/logs",
-        _line("keep", first) * 128,
-        _line("lose", second) * 128,
-        b"unread",
+        _line("keep", first) + _line("routine", first) * 127,
+        _line("keep", second) + _line("routine", second) * 127,
+        _line("keep", _UNTIL) * 128,
+        _line("unread"),
     )
     body = await _call(
         create_server(enable_laravel_tools=False),
@@ -714,11 +1222,11 @@ async def test_grep_regex_timeout_keeps_completed_batches_with_full_budget_each(
         pattern="keep",
         since=_SINCE,
     )
-    assert timeouts == [5, 5]
-    assert body["lines_scanned"] == 128 and body["lines"] == ["keep"] * 128
-    assert body["last_ts"] == body["returned_last_ts"] == first
+    assert timeouts == [5, 3, 1]
+    assert body["lines_scanned"] == 256 and body["lines"] == ["keep", "keep"]
+    assert body["last_ts"] == body["returned_last_ts"] == second
     assert body["truncation_reason"] == "regex_timeout"
-    assert wire.closed and wire.reads == 2
+    assert wire.closed and wire.reads == 3
 
 
 def _laravel_exception(stamp: str, site: str = "/app/Db.php:7") -> str:
@@ -777,9 +1285,11 @@ async def test_laravel_tails_file_discards_cut_record_and_reports_read_boundary(
     )
     source = body["containers"]["app"]["sources"]["laravel.log"]
     assert source["read_from_ts"] == "2026-09-07 10:00:01"
-    clipped = since.endswith("00Z")
-    assert source["truncated"] is clipped
-    assert source["truncation_reason"] == ("bytes_limit" if clipped else None)
+    # Stamps have one-second resolution, so a window that starts in the same
+    # second as the first surviving entry may have lost a cut one as well.
+    assert source["status"] == "partial"
+    assert source["truncated"] is True
+    assert source["truncation_reason"] == "bytes_limit"
     assert [group["file_line"] for group in body["groups"]] == ["/app/Db.php:7"]
     assert body["returned_first_ts"] == body["returned_last_ts"] == "2026-09-07T10:00:01Z"
     assert "tail -c " in json.loads(http.requests[2].content)["Cmd"][2]

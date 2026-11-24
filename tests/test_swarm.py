@@ -371,6 +371,25 @@ async def test_service_logs_envelope_and_params() -> None:
     assert set(body) == {"service", "tail", "since", "truncated", "total_chars", "logs"}
 
 
+@pytest.mark.parametrize("knob", [{"until": "10m"}, {"max_matches": 5}, {"max_bytes": 1000}])
+async def test_service_logs_rejects_window_options_without_since(
+    knob: dict[str, str | int],
+) -> None:
+    fake = _SwarmClient()
+    body = json.loads(
+        _text(
+            await _mcp(fake).call_tool(
+                "portainer_service_logs", {"service_id": "etl_backend", **knob},
+            )
+        )
+    )
+    assert body == {
+        "error": "Validation error",
+        "details": "until, max_matches and max_bytes require since",
+    }
+    assert fake.log_params is None and fake.gets == []
+
+
 # --- service_update -------------------------------------------------------------------
 
 

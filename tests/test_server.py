@@ -64,3 +64,13 @@ def test_server_instructions_are_set() -> None:
     assert "default_endpoint.swarm" in INSTRUCTIONS
     assert "swarm_active" not in INSTRUCTIONS
     assert "registry_id=0" in INSTRUCTIONS
+    # Window answers: the guide must name the fields that say "incomplete",
+    # including the ones laravel_errors nests per container and source.
+    for field in (
+        "truncation_reason",
+        "containers_failed",
+        "failure_reasons",
+        "groups_truncated",
+        "timezone_source",
+    ):
+        assert field in INSTRUCTIONS

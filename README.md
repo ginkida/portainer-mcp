@@ -277,17 +277,37 @@ window. `service_logs` keeps its tail mode with `since` alone. Its window mode
 requires `since` plus `until`, `max_matches`, or `max_bytes`, and returns the
 latest lines in timestamp order. `until` defaults to the time of the call.
 Both bounds accept durations, 9–10 digit Unix seconds, or ISO-8601 timestamps.
-Window responses show the resolved bounds as Unix seconds. Docker applies both
-bounds to container requests. For aggregated Swarm logs, Docker applies `since`
-and the MCP server applies `until`, so bytes outside the window still count.
+Window responses show the resolved bounds as Unix seconds. The MCP server
+applies both bounds exactly to the timestamped records; Docker pre-filters
+container logs, while for aggregated Swarm logs it applies only `since`, so
+bytes after `until` still count toward the byte limit. When that limit is hit,
+`service_logs` returns the latest lines read so far, which may not be the
+latest in the window.
 
 Window scans return `lines_scanned`, observed `first_ts` and `last_ts`, and
 `returned_first_ts` and `returned_last_ts` for the retained output. `max_bytes`
-defaults to 32 MiB and is shared by replicas of one service in a stack scan.
-`max_matches` defaults to 200 and is capped at 1000 across the response. The
-scan continues after reaching the match limit to report coverage.
-`truncation_reason` can be `matches_limit` for omitted output, `bytes_limit`
-for a byte cutoff, or `regex_timeout` for a `grep` scan stopped between batches.
+defaults to 32 MiB (capped at 1 GiB) and is shared by replicas of one service
+in a stack scan. `max_matches` defaults to 200 and is capped at 1000 across the
+response. The scan continues after reaching the match limit to report coverage.
+`truncation_reason` says why a result is incomplete:
+`matches_limit` for omitted output, `bytes_limit` for a byte cutoff,
+`regex_timeout` when the `grep` pattern used up its scan budget (the pattern
+sees the first 8192 characters of a line), or `line_clipped` when only an
+over-long line was cut (`lines_clipped` counts them).
+
+A stalled or broken stream gives a partial answer, not an error. Docker can
+stop sending without closing the connection, so a read ends after 15 seconds
+of silence once data has started (`idle_timeout`) and every window call ends
+after `PORTAINER_LONG_TIMEOUT` seconds (`time_limit`), returning what it has.
+If the stream of `container_logs_grep` or `service_logs` breaks after
+delivering lines, they are returned with `truncation_reason: stream_error`
+and the cause in `stream_error`; a failure before any line is still an error.
+In a stack scan a replica that could not be read is listed in
+`containers_failed` with its cause in `failure_reasons`, and the other
+replicas are still reported — `truncated` does not cover failed replicas.
+
+`container_logs_grep` with `since` is always a window scan: `tail` applies
+only without `since` (before 0.9.0 the two were combined).
 
 ### Laravel (opt-in: `PORTAINER_ENABLE_LARAVEL_TOOLS=true`)
 
@@ -299,11 +319,25 @@ for a byte cutoff, or `regex_timeout` for a `grep` scan stopped between batches.
 Laravel's window scan includes running containers and uses merged Docker logs
 for TTY containers. The file source reads its latest `max_bytes` and reports
 the first complete record as `read_from_ts`. The source is partial when the
-file tail cuts into the requested window. File timestamps without an offset
-use the container's current UTC offset, reported as `timezone_offset`. Pass
-`timezone` to override it with an IANA name or UTC offset. `count_by_source`
-shows `stderr` and `file` counts. File entries shared across replicas are counted
-once, with repeated entries within a file preserved.
+file tail cuts into the requested window. Only `laravel.log` is read: with
+`LOG_CHANNEL=daily` the file is reported as `missing`.
+
+File timestamps without an offset are written in Laravel's `app.timezone`,
+which the container's own clock setting does not reveal. The scan derives the
+offset from the newest entry and the file's modification time, and falls back
+to the container's current UTC offset when that is inconclusive (and to UTC
+when the image has no `date`); `timezone_offset` and `timezone_source`
+(`file_mtime`, `container`, `assumed_utc` or `argument`) report what was used. Pass `timezone` to override it with an IANA
+name or UTC offset (IANA names need the system time zone database; on Windows
+the `tzdata` package is installed for that). One fixed offset is applied to
+the whole file, so entries from the other side of a DST change are shifted by
+an hour.
+
+`count_by_source` shows `stderr` and `file` counts, and group timestamps are
+UTC. Replicas that mount the same log file (identified by its inode and a
+checksum of its first bytes) count each entry once; separate files add up. Coverage, `status`
+and the `error` of a failed source are reported per container and source under
+`containers`, and `groups_truncated` covers the group list.
 
 ### Images
 

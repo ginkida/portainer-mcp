@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 import pytest
@@ -458,6 +458,116 @@ async def test_api_key_mode_does_not_retry_401(monkeypatch: pytest.MonkeyPatch) 
 
     assert excinfo.value.response.status_code == 401
     assert calls == {"data": 1, "auth": 0}  # a static key can't be refreshed
+
+
+class _StreamBody(httpx.AsyncByteStream):
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self.content
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize(
+    ("api_key", "statuses", "auth_calls"),
+    [
+        (False, [403, 200], 2),
+        (False, [401, 403], 2),
+        (True, [401], 0),
+        (True, [403], 0),
+    ],
+)
+async def test_stream_auth_retry_limit_closes_rejected_bodies(
+    monkeypatch: pytest.MonkeyPatch, api_key: bool, statuses: list[int], auth_calls: int,
+) -> None:
+    auths = 0
+    auth_headers: list[str] = []
+    # Reach the error-body cap before EOF so httpx's EOF cleanup cannot
+    # hide a missing explicit close on a rejected stream.
+    bodies = [
+        _StreamBody(b"data" if status == 200 else b"invalid CSRF token " + b"x" * 9000)
+        for status in statuses
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal auths
+        assert all(body.closed for body in bodies[:len(auth_headers)])
+        if request.url.path == "/api/auth":
+            auths += 1
+        bootstrap = _auth_ok(request, jwt=f"JWT{auths}")
+        if bootstrap is not None:
+            return bootstrap
+        index = len(auth_headers)
+        header = "X-API-Key" if api_key else "Authorization"
+        auth_headers.append(request.headers[header])
+        return httpx.Response(statuses[index], stream=bodies[index])
+
+    client = _api_key_client(handler, monkeypatch) if api_key else build_client(handler)
+    try:
+        if statuses[-1] == 200:
+            async with client.stream("GET", "/api/logs") as response:
+                assert await response.aread() == b"data"
+        else:
+            with pytest.raises(httpx.HTTPStatusError) as excinfo:
+                async with client.stream("GET", "/api/logs"):
+                    pytest.fail("The rejected stream was yielded")
+            assert excinfo.value.response.status_code == statuses[-1]
+    finally:
+        await client.close()
+
+    assert auths == auth_calls
+    assert auth_headers == (["ptr_key_1"] if api_key else ["Bearer JWT1", "Bearer JWT2"])
+    assert all(body.closed for body in bodies)
+
+
+@pytest.mark.parametrize("status", [200, 401])
+async def test_stream_cancellation_waits_for_body_close(status: int) -> None:
+    closing = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class _BlockingClose(_StreamBody):
+        async def aclose(self) -> None:
+            closing.set()
+            await release_close.wait()
+            await super().aclose()
+
+    body = _BlockingClose(b"data")
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        bootstrap = _auth_ok(request)
+        if bootstrap is not None:
+            return bootstrap
+        attempts += 1
+        assert attempts == 1
+        return httpx.Response(status, stream=body)
+
+    client = build_client(handler)
+
+    async def consume() -> None:
+        async with client.stream("GET", "/api/logs"):
+            assert status == 200
+
+    task = asyncio.create_task(consume())
+    close_started = asyncio.create_task(closing.wait())
+    try:
+        await asyncio.wait((task, close_started), return_when=asyncio.FIRST_COMPLETED)
+        assert closing.is_set() and not task.done()
+        task.cancel()
+        asyncio.get_running_loop().call_soon(release_close.set)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert body.closed
+    finally:
+        release_close.set()
+        close_started.cancel()
+        await asyncio.gather(close_started, task, return_exceptions=True)
+        await client.close()
 
 
 async def test_non_json_200_body_raises_descriptive_error() -> None:

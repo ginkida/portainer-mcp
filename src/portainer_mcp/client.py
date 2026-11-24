@@ -42,6 +42,23 @@ def _cookieless_jar() -> CookieJar:
     return CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
 
 
+async def _close_stream(response: httpx.Response) -> None:
+    # A cancelled close can leave the pool slot occupied even after httpx
+    # marks the response closed. Wait for cleanup before propagating cancellation.
+    closing = asyncio.create_task(response.aclose())
+    cancelled: asyncio.CancelledError | None = None
+    try:
+        while not closing.done():
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        closing.result()
+    finally:
+        if cancelled is not None:
+            raise cancelled
+
+
 class PortainerClient:
     """HTTP client for the Portainer API with JWT authentication."""
 
@@ -80,10 +97,7 @@ class PortainerClient:
         )
 
     def _jwt_is_fresh(self) -> bool:
-        return (
-            self._jwt is not None
-            and time.monotonic() - self._jwt_obtained_at < self._jwt_ttl
-        )
+        return self._jwt is not None and time.monotonic() - self._jwt_obtained_at < self._jwt_ttl
 
     async def _do_authenticate(self) -> None:
         config = get_config()
@@ -152,8 +166,7 @@ class PortainerClient:
         cl = resp.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > _MAX_RESPONSE_BYTES:
             raise ValueError(
-                f"Portainer response too large: {cl} bytes "
-                f"(max {_MAX_RESPONSE_BYTES})."
+                f"Portainer response too large: {cl} bytes (max {_MAX_RESPONSE_BYTES})."
             )
         if len(resp.content) > _MAX_RESPONSE_BYTES:
             raise ValueError(
@@ -187,7 +200,11 @@ class PortainerClient:
 
     @asynccontextmanager
     async def stream(
-        self, method: str, path: str, timeout: float | None = None, **kwargs: Any,
+        self,
+        method: str,
+        path: str,
+        timeout: float | None = None,
+        **kwargs: Any,
     ) -> AsyncIterator[httpx.Response]:
         """Open an authenticated stream. The caller applies its body limit."""
         headers = {**(kwargs.pop("headers", None) or {}), "Accept-Encoding": "identity"}
@@ -195,10 +212,16 @@ class PortainerClient:
         try:
             yield resp
         finally:
-            await resp.aclose()
+            await _close_stream(resp)
 
     async def _request(
-        self, method: str, path: str, timeout: float | None, *, stream: bool, **kwargs: Any,
+        self,
+        method: str,
+        path: str,
+        timeout: float | None,
+        *,
+        stream: bool,
+        **kwargs: Any,
     ) -> httpx.Response:
         await self._ensure_auth()
         # Capture the auth generation we're about to use, so retry logic
@@ -226,9 +249,7 @@ class PortainerClient:
                 retry_401 = can_retry and resp.status_code == 401
                 if stream and not resp.is_success and not retry_401:
                     resp = await self._stream_error(opened)
-                retry = retry_401 or (
-                    can_retry and resp.status_code == 403 and "CSRF" in resp.text
-                )
+                retry = retry_401 or (can_retry and resp.status_code == 403 and "CSRF" in resp.text)
                 if not retry:
                     if not stream:
                         self._enforce_response_size(resp)
@@ -237,7 +258,7 @@ class PortainerClient:
                     return resp
             finally:
                 if stream and not keep_open:
-                    await opened.aclose()
+                    await _close_stream(opened)
 
             # Close a rejected stream before refreshing auth, which may need
             # the same connection slot. Both modes retry at most once.
@@ -261,8 +282,13 @@ class PortainerClient:
         if resp.is_stream_consumed:
             body.extend(resp.content[:_STREAM_ERROR_BYTES])
         else:
-            async for chunk in resp.aiter_raw():
-                body.extend(chunk[:_STREAM_ERROR_BYTES - len(body)])
+            # Not aiter_raw(): it closes the response on its own at EOF, and a
+            # cancellation landing in that close leaks the pool slot. The one
+            # close is the caller's _close_stream().
+            stream = resp.stream
+            assert isinstance(stream, httpx.AsyncByteStream)
+            async for chunk in stream:
+                body.extend(chunk[: _STREAM_ERROR_BYTES - len(body)])
                 if len(body) == _STREAM_ERROR_BYTES:
                     break
         return httpx.Response(resp.status_code, content=bytes(body), request=resp.request)

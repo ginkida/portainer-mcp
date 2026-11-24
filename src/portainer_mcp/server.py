@@ -38,9 +38,15 @@ portainer_service_tasks and portainer_service_logs first; containers are transie
 task instances.
 - For a time range, pass since to portainer_container_logs_grep or \
 portainer_stack_logs_errors, or pass both since and until to portainer_service_logs. \
-Check first_ts, last_ts, returned_last_ts, truncation_reason and any source failures. \
-When enabled, portainer_laravel_errors groups exceptions from stderr and the \
-current Laravel log file for the same window.
+A window answer is complete only when truncated is false and no source failed: \
+check truncation_reason (idle_timeout / time_limit / stream_error mean the stream \
+stalled or broke and the lines are partial), first_ts / last_ts against the range \
+you asked for, and containers_failed / failure_reasons. When enabled, \
+portainer_laravel_errors groups exceptions from stderr and the current Laravel log \
+file for the same window; its coverage is per container and source \
+(containers.*.sources.*.status / error / truncation_reason), groups_truncated \
+covers the group list, and timezone_source says how the log file's timestamps \
+were placed.
 - Before editing a stack, ALWAYS call portainer_stack_inspect (with reveal_env=true \
 if you intend to resend the compose file) and base your change on the current \
 file. Values shown as [REDACTED] are masked credentials — never write them back.

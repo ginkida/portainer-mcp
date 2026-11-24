@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, tzinfo
 from typing import Any
 
+import httpx
+
 from ..client import PortainerClient
-from ..errors import PortainerResponseError, redact_secrets
+from ..errors import _MAX_REDACT_CHARS, PortainerResponseError, redact_secrets
 
 _MAX_LOG_CHARS = 100_000
+# Longest silence tolerated once a log stream has started delivering data.
+_STREAM_IDLE_SECONDS = 15.0
+_MAX_REASON_CHARS = 300
 _DEFAULT_LOG_BYTES = 32 * 1024 * 1024
+_MAX_LOG_BYTES = 1024**3
 _DEFAULT_LOG_MATCHES = 200
 _MAX_LOG_MATCHES = 1000
 _NS = 1_000_000_000
@@ -106,7 +113,10 @@ class _LogWindow:
             # whole second and apply both exact bounds to timestamped records.
             params["since"] = str(self.since // _NS)
         else:
-            params.update(self.bounds())
+            params["since"] = _docker_time(self.since)
+            # json-file stops at the first record newer than until. Allow
+            # for out-of-order records near the edge and filter exactly here.
+            params["until"] = str((self.until + _NS - 1) // _NS + 1)
         return params
 
 
@@ -122,6 +132,14 @@ class _LogCoverage:
     returned_first: tuple[int, str] | None = None
     returned_last: tuple[int, str] | None = None
     stop_reason: str | None = None
+    deadline: float | None = None
+    error: str | None = None
+
+    def fail(self, exc: Exception) -> None:
+        """A single source broke after delivering lines: keep them and say why."""
+        self.error = redact_secrets(str(exc))[:_MAX_REASON_CHARS] or type(exc).__name__
+        if self.stop_reason is None:
+            self.stop_reason = "stream_error"
 
     def scan(self, ns: int, timestamp: str) -> bool:
         if not self.window.since <= ns <= self.window.until:
@@ -142,6 +160,8 @@ class _LogCoverage:
     def include(self, other: _LogCoverage) -> None:
         self.bytes_read += other.bytes_read
         self.bytes_limited |= other.bytes_limited
+        if other.stop_reason is not None:
+            self.stop_reason = other.stop_reason
         self.lines_scanned += other.lines_scanned
         if other.first and (self.first is None or other.first[0] < self.first[0]):
             self.first = other.first
@@ -151,12 +171,18 @@ class _LogCoverage:
             if returned:
                 self.returned(*returned)
 
-    def summary(self, matches_limited: bool = False) -> dict[str, Any]:
-        reason = self.stop_reason or (
-            "bytes_limit" if self.bytes_limited else ("matches_limit" if matches_limited else None)
-        )
-        return {
+    def summary(self, matches_limited: bool = False, lines_clipped: int = 0) -> dict[str, Any]:
+        reason = self.stop_reason
+        if reason is None:
+            if self.bytes_limited:
+                reason = "bytes_limit"
+            elif matches_limited:
+                reason = "matches_limit"
+            elif lines_clipped:
+                reason = "line_clipped"
+        body = {
             "lines_scanned": self.lines_scanned,
+            "lines_clipped": lines_clipped,
             "first_ts": self.first[1] if self.first else None,
             "last_ts": self.last[1] if self.last else None,
             "returned_first_ts": self.returned_first[1] if self.returned_first else None,
@@ -165,6 +191,9 @@ class _LogCoverage:
             "truncated": reason is not None,
             "truncation_reason": reason,
         }
+        if self.error is not None:
+            body["stream_error"] = self.error
+        return body
 
 
 @dataclass
@@ -172,13 +201,15 @@ class _MatchBudget:
     limit: int
     chars_left: int = _MAX_LOG_CHARS
     kept: int = 0
+    clipped: int = 0
 
     def context(self, text: str) -> str | None:
-        text = redact_secrets(text)
-        if len(text) + 1 > self.chars_left:
+        output = redact_secrets(text)
+        if len(output) + 1 > self.chars_left:
             return None
-        self.chars_left -= len(text) + 1
-        return text
+        self.chars_left -= len(output) + 1
+        self.clipped += len(text) > _MAX_REDACT_CHARS
+        return output
 
     def match(self, text: str) -> str | None:
         if self.kept >= self.limit:
@@ -187,6 +218,10 @@ class _MatchBudget:
         if output is not None:
             self.kept += 1
         return output
+
+
+def _clamp_bytes(max_bytes: int) -> int:
+    return max(1, min(max_bytes, _MAX_LOG_BYTES))
 
 
 def _clamp_matches(max_matches: int) -> int:
@@ -238,6 +273,13 @@ class _DockerLines:
         self._stream = 0
         self._remaining = 0
         self._lines: dict[int | None, _PartialLine] = {}
+        self._error = bytearray()
+
+    def _system_error(self) -> PortainerResponseError:
+        text = self._error.decode("utf-8", errors="replace").strip()
+        return PortainerResponseError(
+            f"Docker reported an error in its log stream: {redact_secrets(text)[:500]}"
+        )
 
     def _payload(self, stream: int | None, data: bytes) -> Iterator[tuple[int | None, str]]:
         line = self._lines.setdefault(stream, _PartialLine())
@@ -256,9 +298,15 @@ class _DockerLines:
                 return
             if self._remaining:
                 size = min(self._remaining, len(data) - pos)
-                yield from self._payload(self._stream, data[pos : pos + size])
+                if self._stream == 3:
+                    collect = min(size, _MAX_REDACT_CHARS - len(self._error))
+                    self._error.extend(data[pos : pos + collect])
+                else:
+                    yield from self._payload(self._stream, data[pos : pos + size])
                 self._remaining -= size
                 pos += size
+                if self._stream == 3 and not self._remaining:
+                    raise self._system_error()
                 continue
             size = min(8 - len(self._header), len(data) - pos)
             self._header.extend(data[pos : pos + size])
@@ -272,14 +320,16 @@ class _DockerLines:
                 self._multiplexed = False
                 yield from self._payload(None, bytes(self._header))
             else:
-                if stream == 3:
-                    raise PortainerResponseError("Docker reported an error in its log stream")
                 self._multiplexed = True
                 self._stream = stream
                 self._remaining = int.from_bytes(self._header[4:8], "big")
+                if stream == 3 and not self._remaining:
+                    raise self._system_error()
             self._header.clear()
 
     def finish(self) -> Iterator[tuple[int | None, str]]:
+        if self._stream == 3:
+            raise self._system_error()
         if self._multiplexed and (self._header or self._remaining):
             raise PortainerResponseError("Docker log stream ended mid-frame")
         if self._header:
@@ -287,6 +337,19 @@ class _DockerLines:
         for stream, line in self._lines.items():
             if line.length:
                 yield stream, line.finish()
+
+
+def _raw_chunks(resp: httpx.Response) -> AsyncIterator[bytes]:
+    if resp.is_stream_consumed:
+        # A body that arrived already read (httpx.MockTransport with content=).
+        return resp.aiter_bytes()
+    # Not aiter_raw(): it closes the response on its own at EOF, and a task
+    # cancellation landing inside that close leaves the pool slot occupied
+    # while the response already claims to be closed. Reading the transport
+    # stream directly leaves one close — client.stream()'s, which is shielded.
+    stream = resp.stream
+    assert isinstance(stream, httpx.AsyncByteStream)
+    return stream.__aiter__()
 
 
 async def _read_log_lines(
@@ -304,7 +367,33 @@ async def _read_log_lines(
     async with client.stream(method, path, timeout=timeout, **kwargs) as resp:
         if resp.headers.get("content-encoding", "identity").lower() != "identity":
             raise PortainerResponseError("Portainer compressed a log stream requested as identity")
-        async for chunk in resp.aiter_bytes() if resp.is_stream_consumed else resp.aiter_raw():
+        chunks = _raw_chunks(resp)
+        received = False
+        while True:
+            # Bound the wait itself, not just the gap between chunks: Docker
+            # can stop sending without closing (seen on Swarm service logs),
+            # and the HTTP read timeout would turn that into an error that
+            # throws away everything already read.
+            wait = None if coverage.deadline is None else coverage.deadline - time.monotonic()
+            if wait is not None and wait <= 0:
+                coverage.stop_reason = "time_limit"
+                return
+            reason = "time_limit"
+            if received and (wait is None or wait > _STREAM_IDLE_SECONDS):
+                # Before the first byte Docker may be skipping old records to
+                # reach `since`; once data flows, a long silence is a stall.
+                wait, reason = _STREAM_IDLE_SECONDS, "idle_timeout"
+            try:
+                chunk = await asyncio.wait_for(chunks.__anext__(), wait)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                coverage.stop_reason = reason
+                return
+            received = True
+            if coverage.deadline is not None and time.monotonic() >= coverage.deadline:
+                coverage.stop_reason = "time_limit"
+                return
             # The last transport chunk can straddle the byte limit. Process
             # just its prefix and leave any unread tail on the connection.
             size = min(len(chunk), limit - coverage.bytes_read)

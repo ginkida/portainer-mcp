@@ -16,6 +16,8 @@ from mcp.server.fastmcp import FastMCP
 from ..client import PortainerClient, get_client
 from ..config import get_config
 from ..errors import (
+    _MAX_REDACT_CHARS,
+    PortainerResponseError,
     redact_env_strings,
     redact_secrets,
     resolve_endpoint,
@@ -38,6 +40,7 @@ from .logs import (
     _DEFAULT_LOG_BYTES,
     _DEFAULT_LOG_MATCHES,
     _MAX_LOG_CHARS,
+    _clamp_bytes,
     _clamp_matches,
     _docker_window_lines,
     _LogCoverage,
@@ -608,51 +611,85 @@ def register(mcp: FastMCP) -> None:
             endpoint_id: Target endpoint ID (uses default if omitted)
             until: End of the window, same formats as since (default: now)
             max_matches: Window lines to return (default 200, max 1000)
-            max_bytes: Window Docker response byte limit (default 32 MiB)
+            max_bytes: Window Docker response byte limit (default 32 MiB, max 1 GiB)
         """
         _validate_service_id(service_id)
         tail = max(1, min(tail, 1000))
         window = None
         if until is not None or max_bytes is not None or max_matches is not None:
+            if since is None or not since.strip():
+                raise ValueError("until, max_matches and max_bytes require since")
             window = _LogWindow.parse(since, until)
         client = get_client()
         config = get_config()
         eid = resolve_endpoint(endpoint_id, config.default_endpoint)
         path = f"/api/endpoints/{eid}/docker/services/{quote(service_id, safe='')}/logs"
         if window is not None:
-            byte_limit = _DEFAULT_LOG_BYTES if max_bytes is None else max(1, max_bytes)
-            coverage = _LogCoverage(window, byte_limit)
+            byte_limit = _DEFAULT_LOG_BYTES if max_bytes is None else _clamp_bytes(max_bytes)
+            coverage = _LogCoverage(
+                window,
+                byte_limit,
+                deadline=time.monotonic() + config.long_timeout,
+            )
             limit = _clamp_matches(_DEFAULT_LOG_MATCHES if max_matches is None else max_matches)
-            recent: list[tuple[int, int, str, str]] = []
-            async with aclosing(_docker_window_lines(
-                client, path, coverage, config.long_timeout, swarm=True, timestamps=timestamps,
-            )) as lines:
-                async for _, text, ns, stamp in lines:
-                    order = (ns, coverage.lines_scanned)
-                    if len(recent) == limit and order <= recent[0][:2]:
-                        continue
-                    candidate = (*order, stamp, redact_secrets(text))
-                    if len(recent) == limit:
-                        heapq.heapreplace(recent, candidate)
-                    else:
-                        heapq.heappush(recent, candidate)
+            recent: list[tuple[int, int, str, str, bool]] = []
+            try:
+                async with aclosing(
+                    _docker_window_lines(
+                        client,
+                        path,
+                        coverage,
+                        config.long_timeout,
+                        swarm=True,
+                        timestamps=timestamps,
+                    )
+                ) as lines:
+                    async for _, text, ns, stamp in lines:
+                        order = (ns, coverage.lines_scanned)
+                        if len(recent) == limit and order <= recent[0][:2]:
+                            continue
+                        candidate = (
+                            *order,
+                            stamp,
+                            redact_secrets(text),
+                            len(text) > _MAX_REDACT_CHARS,
+                        )
+                        if len(recent) == limit:
+                            heapq.heapreplace(recent, candidate)
+                        else:
+                            heapq.heappush(recent, candidate)
+            except (httpx.HTTPError, PortainerResponseError) as exc:
+                # Swarm reports an unreachable node or a broken task log as a
+                # failure at the END of the stream. Before any line that is an
+                # error; after, the lines already read are the answer.
+                if coverage.lines_scanned == 0:
+                    raise
+                coverage.fail(exc)
 
             output_lines = []
             remaining = _MAX_LOG_CHARS
-            for ns, _, stamp, line in sorted(recent, reverse=True):
+            lines_clipped = 0
+            for ns, _, stamp, line, clipped in sorted(recent, reverse=True):
                 remaining -= len(line) + 1
                 if remaining < 0:
                     break
                 output_lines.append(line + "\n")
+                lines_clipped += clipped
                 coverage.returned(ns, stamp)
-            return json.dumps({
-                "service": service_id, **window.bounds(),
-                **coverage.summary(len(output_lines) < coverage.lines_scanned),
-                "logs": "".join(reversed(output_lines)),
-            }, indent=2, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "service": service_id,
+                    **window.bounds(),
+                    **coverage.summary(len(output_lines) < coverage.lines_scanned, lines_clipped),
+                    "logs": "".join(reversed(output_lines)),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
 
         resp = await client.request(
-            "GET", path,
+            "GET",
+            path,
             params=_log_params(tail, since, timestamps),
             timeout=config.long_timeout,
         )
